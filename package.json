@@ -1,0 +1,36 @@
+{
+  "name": "multig-mcp",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Local, read-only multi-account Gmail MCP server for macOS.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22.14.0 <25"
+  },
+  "packageManager": "pnpm@11.8.0",
+  "bin": {
+    "multig-mcp": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test",
+    "test:auth": "node --test --experimental-strip-types test/auth test/accounts test/storage",
+    "test:mcp": "node --test --experimental-strip-types test/mcp test/gmail",
+    "test:integration": "node --test --experimental-strip-types test/integration",
+    "proof:keychain": "node --experimental-strip-types proofs/keychain.ts",
+    "proof:mcp": "node --experimental-strip-types proofs/mcp.ts",
+    "proof:oauth": "node --experimental-strip-types proofs/oauth.ts",
+    "proof:metadata": "node --experimental-strip-types proofs/metadata.ts",
+    "proof:mime": "node --experimental-strip-types proofs/mime.ts"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "googleapis": "176.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "5.9.3"
+  }
+}
