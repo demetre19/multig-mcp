@@ -143,6 +143,7 @@ async function startCallbackListener(state: OneUseState, timeoutMs: number): Pro
   let closePromise: Promise<void> | undefined;
   let settled = false;
   const resultResolvers = deferred<{ code: string }>();
+  void resultResolvers.promise.catch(() => undefined);
 
   const closeServer = (): Promise<void> => {
     if (!server.listening) return Promise.resolve();
@@ -291,6 +292,7 @@ export async function runOAuthFlow(options: OAuthFlowOptions): Promise<OAuthFlow
       throw new OAuthFlowError("oauth_exchange_failed");
     }
     assertExactReadonlyScope(tokens.scope);
+    client.setCredentials(tokens);
     let email: string;
     try {
       email = await profile(client);

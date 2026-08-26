@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { request } from "node:http";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
@@ -12,7 +12,7 @@ import {
   reauthorizeAccount,
   removeAccount,
   AuthLifecycleError,
-} from "../../dist/auth/lifecycle.js";
+} from "../../src/auth/lifecycle.ts";
 import {
   buildRedirectUri,
   READONLY_SCOPE,
@@ -20,9 +20,9 @@ import {
   OneUseState,
   validateCallbackRequest,
   type OAuthFlowResult,
-} from "../../dist/auth/oauth.js";
-import { readConfig } from "../../dist/storage/config.js";
-import { KeychainError, KeychainStore, type KeychainOperation } from "../../dist/storage/keychain.js";
+} from "../../src/auth/oauth.ts";
+import { readConfig } from "../../src/storage/config.ts";
+import { KeychainError, KeychainStore } from "../../src/storage/keychain.ts";
 
 const directories: string[] = [];
 
@@ -90,7 +90,12 @@ describe("OAuth callback and PKCE", () => {
   it("runs the loopback flow with exact scope and Gmail identity seams", async () => {
     let authorization: Record<string, unknown> | undefined;
     let exchanged: { code: string; verifier: string; redirectUri: string } | undefined;
+    let profileCredentials: Record<string, unknown> | undefined;
     const fakeClient = {
+      credentials: {} as Record<string, unknown>,
+      setCredentials(credentials: Record<string, unknown>) {
+        this.credentials = { ...credentials };
+      },
       async generateCodeVerifierAsync() { return { codeVerifier: "verifier", codeChallenge: "challenge" }; },
       generateAuthUrl(options: Record<string, unknown>) {
         authorization = options;
@@ -118,16 +123,114 @@ describe("OAuth callback and PKCE", () => {
       },
       exchangeCode: async (_client, code, verifier, redirectUri) => {
         exchanged = { code, verifier, redirectUri };
-        return { scope: READONLY_SCOPE, refresh_token: "refresh-token" };
+        return { scope: READONLY_SCOPE, refresh_token: "refresh-token", access_token: "access-token", expiry_date: 123 };
       },
-      fetchProfile: async () => "owner@example.test",
+      fetchProfile: async (client) => {
+        profileCredentials = { ...client.credentials } as Record<string, unknown>;
+        return "owner@example.test";
+      },
     });
     assert.deepEqual(result, { email: "owner@example.test", scopes: [READONLY_SCOPE], refreshToken: "refresh-token" });
+    assert.deepEqual(profileCredentials, {
+      scope: READONLY_SCOPE,
+      refresh_token: "refresh-token",
+      access_token: "access-token",
+      expiry_date: 123,
+    });
     assert.equal(authorization?.access_type, "offline");
     assert.equal(authorization?.prompt, "consent");
     assert.equal(authorization?.code_challenge_method, "S256");
     assert.deepEqual(authorization?.scope, [READONLY_SCOPE]);
     assert.deepEqual(exchanged, { code: "authorization-code", verifier: "verifier", redirectUri: authorization?.redirect_uri });
+  });
+  it("closes callback listeners on browser and exchange terminal paths", async () => {
+    const probeClosedPort = async (redirectUri: string): Promise<void> => {
+      const status = await new Promise<"closed" | "open">((resolve) => {
+        const callbackRequest = request(redirectUri, (response) => {
+          response.resume();
+          resolve("open");
+        });
+        callbackRequest.once("error", () => resolve("closed"));
+        callbackRequest.end();
+      });
+      assert.equal(status, "closed");
+    };
+    let authorization: Record<string, unknown> | undefined;
+    let redirectUri = "";
+    const createClient = () => ({
+      async generateCodeVerifierAsync() { return { codeVerifier: "verifier", codeChallenge: "challenge" }; },
+      generateAuthUrl(options: Record<string, unknown>) {
+        authorization = options;
+        return "https://accounts.google.test/authorize";
+      },
+    }) as never;
+    const browserError = await runOAuthFlow({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      createClient,
+      openBrowser: async () => {
+        redirectUri = authorization?.redirect_uri as string;
+        throw new Error("browser unavailable");
+      },
+    }).then(() => undefined, (error: unknown) => error);
+    assert.equal((browserError as { code?: unknown } | undefined)?.code, "oauth_callback_invalid");
+    await probeClosedPort(redirectUri);
+
+    authorization = undefined;
+    redirectUri = "";
+    const exchangeError = await runOAuthFlow({
+      clientId: "client-id",
+      clientSecret: "client-secret",
+      createClient,
+      openBrowser: async () => {
+        redirectUri = authorization?.redirect_uri as string;
+        const callback = new URL(redirectUri);
+        callback.searchParams.set("state", authorization?.state as string);
+        callback.searchParams.set("code", "authorization-code");
+        await new Promise<void>((resolve, reject) => {
+          const callbackRequest = request(callback, (response) => {
+            response.resume();
+            response.once("end", resolve);
+          });
+          callbackRequest.once("error", reject);
+          callbackRequest.end();
+        });
+      },
+      exchangeCode: async () => {
+        throw new Error("exchange unavailable");
+      },
+    }).then(() => undefined, (error: unknown) => error);
+    assert.equal((exchangeError as { code?: unknown } | undefined)?.code, "oauth_exchange_failed");
+    await probeClosedPort(redirectUri);
+  });
+});
+
+describe("Keychain helper contract", () => {
+  it("passes canonical records and secret bytes through the helper protocol", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "multig-mcp-keychain-"));
+    directories.push(directory);
+    const helper = join(directory, "helper");
+    const argumentsPath = join(directory, "arguments");
+    const inputPath = join(directory, "input");
+    await writeFile(helper, `#!/bin/sh
+printf '%s\n%s\n' "$1" "$2" >> '${argumentsPath}'
+if [ "$1" = "create" ]; then
+  cat > '${inputPath}'
+else
+  printf 'read-secret' >&3
+fi
+`);
+    await chmod(helper, 0o700);
+    const keychain = new KeychainStore({ helperPath: helper });
+    await keychain.createSecret("gmail:Primary", "secret-bytes");
+    assert.equal((await keychain.readSecret("gmail:Primary")).toString("utf8"), "read-secret");
+    assert.equal((await readFile(inputPath, "utf8")), "secret-bytes");
+    assert.deepEqual((await readFile(argumentsPath, "utf8")).trim().split("\n"), [
+      "create",
+      "gmail:primary",
+      "read",
+      "gmail:primary",
+    ]);
   });
 });
 

@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import { timingSafeEqual } from "node:crypto";
 import { google } from "googleapis";
 import { z } from "zod";
-import { listAccounts, type AccountManagerOptions } from "../accounts/index.js";
+import { invalidateAccountSession, listAccounts, type AccountManagerOptions } from "../accounts/index.js";
 import type { AccountSummary } from "../contracts.js";
 import {
   getConfigPath,
@@ -180,6 +180,7 @@ export async function addAccount(aliasInput: string, options: AuthLifecycleOptio
     if (created) await keychain.deleteAccountRefreshToken(alias, true).catch(() => undefined);
     throw error;
   }
+  invalidateAccountSession(configPath, alias);
   return result;
 }
 
@@ -231,6 +232,7 @@ export async function reauthorizeAccount(aliasInput: string, options: AuthLifecy
     if (current.accounts[alias] === undefined) throw new AuthLifecycleError("unknown_account", alias);
     current.accounts[alias] = accountMetadata(alias, result.email);
   });
+  invalidateAccountSession(configPath, alias);
   return result;
 }
 
@@ -248,6 +250,7 @@ export async function removeAccount(aliasInput: string, options: AuthLifecycleOp
   await mutateConfig(configPath, (current) => {
     delete current.accounts[alias];
   });
+  invalidateAccountSession(configPath, alias);
 }
 
 export async function listAuthAccounts(options: AuthLifecycleOptions = {}): Promise<AccountSummary[]> {

@@ -4,9 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { Auth } from "googleapis";
-import { AccountManager, AccountSessionError, mapGoogleError, redactSensitive } from "../../dist/accounts/index.js";
-import { mutateConfig, READONLY_SCOPE } from "../../dist/storage/config.js";
-import { KeychainError, KeychainStore } from "../../dist/storage/keychain.js";
+import { AccountManager, AccountSessionError, mapGoogleError, redactSensitive } from "../../src/accounts/index.ts";
+import { addAccount, reauthorizeAccount, removeAccount } from "../../src/auth/lifecycle.ts";
+import { mutateConfig, READONLY_SCOPE } from "../../src/storage/config.ts";
+import { KeychainError, KeychainStore } from "../../src/storage/keychain.ts";
 
 const directories: string[] = [];
 
@@ -16,6 +17,7 @@ afterEach(async () => {
 
 class MemoryKeychain extends KeychainStore {
   readonly values = new Map<string, Buffer>();
+  failRefreshReplacement = false;
 
   constructor() {
     super({ helperPath: "/dev/null" });
@@ -29,6 +31,10 @@ class MemoryKeychain extends KeychainStore {
   override async replaceSecret(record: string, secret: Buffer | string): Promise<void> {
     if (!this.values.has(record)) throw new KeychainError("replace", "not_found", 11);
     this.values.set(record, Buffer.from(secret));
+  }
+  override async replaceAccountRefreshToken(alias: string, secret: string): Promise<void> {
+    if (this.failRefreshReplacement) throw new KeychainError("replace", "unavailable", null);
+    await super.replaceAccountRefreshToken(alias, secret);
   }
 
   override async readSecret(record: string): Promise<Buffer> {
@@ -115,5 +121,78 @@ describe("account session contract", () => {
     const redacted = redactSensitive({ nested: { refresh_token: "secret", safe: "value" }, array: [{ accessToken: "secret" }] }) as { nested: { refresh_token: string; safe: string }; array: Array<{ accessToken: string }> };
     assert.deepEqual(redacted, { nested: { refresh_token: "[redacted]", safe: "value" }, array: [{ accessToken: "[redacted]" }] });
     assert.throws(() => { throw new AccountSessionError("unknown_account", "personal"); }, AccountSessionError);
+  });
+  it("invalidates cached sessions across reauthorization and remove plus re-add", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "multig-mcp-accounts-"));
+    directories.push(directory);
+    const configPath = join(directory, "config.json");
+    const keychain = new MemoryKeychain();
+    await keychain.createOAuthClient(JSON.stringify({ clientId: "client-id", clientSecret: "client-secret" }));
+    const flow = (refreshToken: string) => async () => ({ email: "owner@example.test", scopes: [READONLY_SCOPE], refreshToken });
+    await addAccount("personal", { configPath, keychain, oauthFlow: flow("old-refresh") });
+    const clients: Array<{ initialRefreshToken?: string }> = [];
+    const manager = new AccountManager({ configPath, keychain }, {
+      clientFactory: () => {
+        const client = {
+          credentials: {} as { access_token?: string; expiry_date?: number; refresh_token?: string },
+          initialRefreshToken: undefined as string | undefined,
+          setCredentials(credentials: { access_token?: string; expiry_date?: number; refresh_token?: string }) {
+            this.credentials = { ...this.credentials, ...credentials };
+            if (this.initialRefreshToken === undefined && credentials.refresh_token !== undefined) this.initialRefreshToken = credentials.refresh_token;
+          },
+          async getAccessToken() {
+            this.credentials = { ...this.credentials, access_token: "access-token", expiry_date: Date.now() + 300_000 };
+            return { token: "access-token" };
+          },
+          on() { return this; },
+        };
+        clients.push(client);
+        return client as unknown as Auth.OAuth2Client;
+      },
+    });
+    const first = await manager.getAccountSession("personal");
+    await reauthorizeAccount("personal", { configPath, keychain, oauthFlow: flow("new-refresh") });
+    const second = await manager.getAccountSession("personal");
+    await removeAccount("personal", { configPath, keychain });
+    await addAccount("personal", { configPath, keychain, oauthFlow: flow("readded-refresh") });
+    const third = await manager.getAccountSession("personal");
+    assert.notEqual(second, first);
+    assert.notEqual(third, second);
+    assert.deepEqual(clients.map((client) => client.initialRefreshToken), ["old-refresh", "new-refresh", "readded-refresh"]);
+  });
+
+  it("reports refresh-token rotation persistence failure before returning a session", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "multig-mcp-accounts-"));
+    directories.push(directory);
+    const configPath = join(directory, "config.json");
+    const keychain = new MemoryKeychain();
+    await keychain.createOAuthClient(JSON.stringify({ clientId: "client-id", clientSecret: "client-secret" }));
+    await addAccount("personal", { configPath, keychain, oauthFlow: async () => ({ email: "owner@example.test", scopes: [READONLY_SCOPE], refreshToken: "old-refresh" }) });
+    keychain.failRefreshReplacement = true;
+    let tokenListener: ((tokens: { access_token: string; expiry_date: number; refresh_token: string }) => void) | undefined;
+    const client = {
+      credentials: {} as { access_token?: string; expiry_date?: number; refresh_token?: string },
+      setCredentials(credentials: { access_token?: string; expiry_date?: number; refresh_token?: string }) {
+        this.credentials = { ...this.credentials, ...credentials };
+      },
+      async getAccessToken() {
+        const expiryDate = Date.now() + 300_000;
+        tokenListener?.({ access_token: "access-token", expiry_date: expiryDate, refresh_token: "rotated-refresh" });
+        this.credentials = { ...this.credentials, access_token: "access-token", expiry_date: expiryDate };
+        return { token: "access-token" };
+      },
+      on(_event: string, listener: typeof tokenListener) {
+        tokenListener = listener;
+        return this;
+      },
+    };
+    const manager = new AccountManager({ configPath, keychain }, {
+      clientFactory: () => client as unknown as Auth.OAuth2Client,
+    });
+    await assert.rejects(
+      manager.getAccountSession("personal"),
+      (error: unknown) => error instanceof AccountSessionError && error.code === "invalid_local_configuration",
+    );
+    assert.equal((await keychain.readAccountRefreshToken("personal"))?.toString(), "old-refresh");
   });
 });

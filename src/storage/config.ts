@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, readdir, rename, stat, unlink } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, rename, rmdir, stat, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, basename } from "node:path";
@@ -127,38 +127,101 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+const LOCK_OWNER = "owner";
+
+type LockHandle = {
+  close: () => Promise<void>;
+};
+
 async function breakStaleLock(lockPath: string): Promise<boolean> {
+  const ownerPath = join(lockPath, LOCK_OWNER);
+  let details;
   try {
-    const details = await stat(lockPath);
+    details = await stat(ownerPath);
+  } catch (error) {
+    if (!isMissing(error)) return false;
+    try {
+      details = await stat(lockPath);
+    } catch (lockError) {
+      return isMissing(lockError);
+    }
     if (Date.now() - details.mtimeMs < LOCK_STALE_MS) return false;
-    const contents = await readFile(lockPath, "utf8");
-    const pid = Number.parseInt(contents.split("\n", 1)[0] ?? "", 10);
-    if (processIsAlive(pid)) return false;
-    await unlink(lockPath);
+    try {
+      await rmdir(lockPath);
+      return true;
+    } catch (removeError) {
+      return isMissing(removeError);
+    }
+  }
+  if (Date.now() - details.mtimeMs < LOCK_STALE_MS) return false;
+  let contents: string;
+  try {
+    contents = await readFile(ownerPath, "utf8");
+  } catch (error) {
+    return isMissing(error);
+  }
+  const pid = Number.parseInt(contents.split("\n", 1)[0] ?? "", 10);
+  if (processIsAlive(pid)) return false;
+  try {
+    await unlink(ownerPath);
+  } catch (error) {
+    if (!isMissing(error)) return false;
+  }
+  try {
+    await rmdir(lockPath);
     return true;
   } catch (error) {
-    if (isMissing(error)) return true;
-    return false;
+    return isMissing(error);
   }
 }
 
-async function acquireLock(lockPath: string): Promise<FileHandle> {
+async function acquireLock(lockPath: string): Promise<LockHandle> {
   const started = Date.now();
   for (;;) {
     try {
-      const handle = await open(lockPath, "wx", 0o600);
-      await handle.writeFile(`${process.pid}\n${Date.now()}\n`, "utf8");
-      await handle.sync();
-      return handle;
+      await mkdir(lockPath, 0o700);
     } catch (error) {
-      if (!isRecord(error) || error.code !== "EEXIST") {
-        throw new MetadataWriteError();
-      }
+      if (!isRecord(error) || error.code !== "EEXIST") throw new MetadataWriteError();
       if (await breakStaleLock(lockPath)) continue;
       if (Date.now() - started >= LOCK_TIMEOUT_MS) {
         throw new MetadataWriteError("metadata_write_locked");
       }
       await new Promise((resolve) => setTimeout(resolve, 10));
+      continue;
+    }
+
+    const ownerPath = join(lockPath, LOCK_OWNER);
+    let ownerHandle: FileHandle | undefined;
+    let ownerCreated = false;
+    try {
+      ownerHandle = await open(ownerPath, "wx", 0o600);
+      ownerCreated = true;
+      await ownerHandle.writeFile(`${process.pid}\n${Date.now()}\n${randomUUID()}\n`, "utf8");
+      await ownerHandle.sync();
+      const ownerIdentity = await ownerHandle.stat();
+      let released = false;
+      return {
+        close: async () => {
+          if (released) return;
+          released = true;
+          await ownerHandle?.close().catch(() => undefined);
+          let currentIdentity;
+          try {
+            currentIdentity = await stat(ownerPath);
+          } catch {
+            return;
+          }
+          if (currentIdentity.dev !== ownerIdentity.dev || currentIdentity.ino !== ownerIdentity.ino) return;
+          await unlink(ownerPath).catch(() => undefined);
+          await rmdir(lockPath).catch(() => undefined);
+        },
+      };
+    } catch (error) {
+      await ownerHandle?.close().catch(() => undefined);
+      if (ownerCreated) await unlink(ownerPath).catch(() => undefined);
+      await rmdir(lockPath).catch(() => undefined);
+      if (error instanceof MetadataWriteError) throw error;
+      throw new MetadataWriteError();
     }
   }
 }
@@ -215,7 +278,6 @@ export async function writeConfigAtomic(
     await writeLocked(path, config, options);
   } finally {
     await lock.close().catch(() => undefined);
-    await unlink(lockPath).catch(() => undefined);
   }
 }
 
@@ -236,7 +298,6 @@ export async function mutateConfig(
     return validated;
   } finally {
     await lock.close().catch(() => undefined);
-    await unlink(lockPath).catch(() => undefined);
   }
 }
 

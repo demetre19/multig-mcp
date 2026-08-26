@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { Auth, google } from "googleapis";
 import { z } from "zod";
 type OAuth2Client = Auth.OAuth2Client;
@@ -45,8 +46,21 @@ type CachedSession = {
   refreshToken: string;
   accessToken?: string;
   expiryDate?: number;
+  generation: number;
+  refreshTokenWrite?: Promise<void>;
+  refreshTokenPersistenceError?: unknown;
 };
 
+const sessionGenerations = new Map<string, number>();
+
+function sessionGenerationKey(configPath: string, alias: string): string {
+  return `${resolve(configPath)}\u0000${alias}`;
+}
+
+export function invalidateAccountSession(configPath: string, alias: string): void {
+  const key = sessionGenerationKey(configPath, alias);
+  sessionGenerations.set(key, (sessionGenerations.get(key) ?? 0) + 1);
+}
 const EXPIRY_SAFETY_WINDOW_MS = 60_000;
 
 export function redactSensitive(value: unknown): unknown {
@@ -170,16 +184,29 @@ export class AccountManager {
     if (metadata === undefined) throw new AccountSessionError("unknown_account", alias);
     if (!isUsableMetadata(metadata, alias)) throw new AccountSessionError("missing_scope", alias);
 
+    const sessionKey = sessionGenerationKey(this.configPath, alias);
+    const generation = sessionGenerations.get(sessionKey) ?? 0;
     const existing = this.#sessions.get(alias);
-    if (existing !== undefined) {
+    if (existing !== undefined && existing.generation === generation) {
+      let currentRefreshToken: string;
       try {
-        await this.ensureAccessToken(alias, existing);
-        return existing.client;
+        currentRefreshToken = tokenFromBuffer(await this.keychain.readAccountRefreshToken(alias), alias);
       } catch (error) {
+        this.#sessions.delete(alias);
         if (error instanceof AccountSessionError) throw error;
-        throw mapGoogleError(error, alias);
+        throw new AccountSessionError("invalid_local_configuration", alias);
+      }
+      if (currentRefreshToken === existing.refreshToken) {
+        try {
+          await this.ensureAccessToken(alias, existing);
+          return existing.client;
+        } catch (error) {
+          if (error instanceof AccountSessionError) throw error;
+          throw mapGoogleError(error, alias);
+        }
       }
     }
+    this.#sessions.delete(alias);
 
     let clientBytes: Buffer;
     try {
@@ -206,15 +233,21 @@ export class AccountManager {
     const refreshToken = tokenFromBuffer(storedToken, alias);
     const client = this.clientFactory(clientCredentials.clientId, clientCredentials.clientSecret);
     client.setCredentials({ refresh_token: refreshToken });
-    const cached: CachedSession = { client, refreshToken };
+    const cached: CachedSession = { client, refreshToken, generation };
     this.#sessions.set(alias, cached);
     client.on("tokens", (tokens) => {
       const newRefreshToken = typeof tokens.refresh_token === "string" && tokens.refresh_token.trim().length > 0
         ? tokens.refresh_token
         : undefined;
       if (newRefreshToken !== undefined && newRefreshToken !== cached.refreshToken) {
-        cached.refreshToken = newRefreshToken;
-        void this.keychain.replaceAccountRefreshToken(alias, newRefreshToken).catch(() => undefined);
+        const previousWrite = cached.refreshTokenWrite ?? Promise.resolve();
+        cached.refreshTokenWrite = previousWrite.then(async () => {
+          if (cached.refreshTokenPersistenceError !== undefined) return;
+          await this.keychain.replaceAccountRefreshToken(alias, newRefreshToken);
+          cached.refreshToken = newRefreshToken;
+        }).catch((error: unknown) => {
+          cached.refreshTokenPersistenceError = error;
+        });
       }
       if (typeof tokens.access_token === "string" && tokens.access_token.length > 0) cached.accessToken = tokens.access_token;
       if (typeof tokens.expiry_date === "number") cached.expiryDate = tokens.expiry_date;
@@ -230,6 +263,10 @@ export class AccountManager {
   }
 
   private async ensureAccessToken(alias: string, cached: CachedSession): Promise<void> {
+    if (cached.refreshTokenWrite !== undefined) await cached.refreshTokenWrite;
+    if (cached.refreshTokenPersistenceError !== undefined) {
+      throw new AccountSessionError("invalid_local_configuration", alias);
+    }
     const now = Date.now();
     if (cached.accessToken !== undefined && cached.expiryDate !== undefined && cached.expiryDate - now > EXPIRY_SAFETY_WINDOW_MS) {
       cached.client.setCredentials({
@@ -241,6 +278,10 @@ export class AccountManager {
     }
     try {
       const result = await cached.client.getAccessToken();
+      if (cached.refreshTokenWrite !== undefined) await cached.refreshTokenWrite;
+      if (cached.refreshTokenPersistenceError !== undefined) {
+        throw new AccountSessionError("invalid_local_configuration", alias);
+      }
       const token = result.token;
       if (typeof token !== "string" || token.length === 0) throw new AccountSessionError("reauthorization_required", alias);
       cached.accessToken = token;
