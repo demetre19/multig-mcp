@@ -1,7 +1,7 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer, request } from "node:http";
 import { readFile, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 import { request as httpsRequest } from "node:https";
@@ -13,15 +13,9 @@ import { z } from "zod";
 export const READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
 const CALLBACK_PATH = "/oauth2callback";
 const SYNTHETIC_CLIENT_ID = "synthetic-desktop-client.apps.googleusercontent.test";
-const REAL_CREDENTIAL_PATH = join(
-  homedir(),
-  "Documents",
-  "UNCLUTTER-NEW",
-  "CLAUDE-DEV",
-  "Multi G",
-  "SECRET",
-  "client_secret_459145523371-ou3uc7c998qsnvgtccol771qm6grmklp.apps.googleusercontent.com.json",
-);
+const REAL_CREDENTIAL_ENV_ERROR = "set MULTIG_OAUTH_REAL_CREDENTIAL_FILE to run real OAuth proof";
+const REAL_REVOCATION_ERROR = "OAuth refresh-token revocation did not return HTTP 200";
+const INVALID_CALLBACK_ERROR = "invalid authorization callback";
 const REAL_EVIDENCE_PATH = join(tmpdir(), "multig-mcp-oauth-real-proof.json");
 const REAL_AUTH_TIMEOUT_MS = 5 * 60_000;
 
@@ -48,16 +42,15 @@ type DesktopCredential = {
   clientSecret: string;
 };
 
-type RealAuthorizationResult = {
-  passed: true;
-  evidence_path: string;
-  revocation: "revoked" | "skipped";
-};
+type RealAuthorizationResult =
+  | { passed: true; evidence_path: string; revocation: "revoked" }
+  | { passed: false; reason: string };
 
 type RealCallbackListener = {
   port: number;
   result: Promise<string>;
   close: () => Promise<void>;
+  isListening: () => boolean;
 };
 const DesktopCredentialFile = z.object({
   installed: z.object({
@@ -70,8 +63,12 @@ const DesktopCredentialFile = z.object({
 });
 
 async function readDesktopCredential(): Promise<DesktopCredential> {
+  const credentialPath = process.env.MULTIG_OAUTH_REAL_CREDENTIAL_FILE;
+  if (credentialPath === undefined || credentialPath.trim().length === 0) {
+    throw new Error(REAL_CREDENTIAL_ENV_ERROR);
+  }
   try {
-    const parsed = DesktopCredentialFile.parse(JSON.parse(await readFile(REAL_CREDENTIAL_PATH, "utf8")) as unknown);
+    const parsed = DesktopCredentialFile.parse(JSON.parse(await readFile(credentialPath, "utf8")) as unknown);
     return { clientId: parsed.installed.client_id, clientSecret: parsed.installed.client_secret };
   } catch {
     throw new Error("desktop credential could not be read or has an invalid desktop shape");
@@ -111,7 +108,10 @@ async function startRealCallbackListener(state: OneUseState): Promise<RealCallba
   const finish = (code: string | undefined, error: Error | undefined): void => {
     if (settled) return;
     settled = true;
-    clearTimeout(timer);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      timer = undefined;
+    }
     void closeServer().then(() => {
       if (error) resultResolvers.reject(error);
       else if (code === undefined) resultResolvers.reject(new Error("callback code missing"));
@@ -124,8 +124,12 @@ async function startRealCallbackListener(state: OneUseState): Promise<RealCallba
     const redirectUri = `http://127.0.0.1:${addressPort}${CALLBACK_PATH}`;
     const callback = validateCallbackRequest(incoming.method, incoming.url ?? "", redirectUri, state);
     response.statusCode = callback.accepted ? 200 : 400;
+    response.setHeader("connection", "close");
     response.end(callback.accepted ? "Authorization received. You may return to the terminal." : "Invalid authorization callback.");
-    if (!callback.accepted) return;
+    if (!callback.accepted) {
+      finish(undefined, new Error(INVALID_CALLBACK_ERROR));
+      return;
+    }
     if ("code" in callback) finish(callback.code, undefined);
     else finish(undefined, new Error("authorization was denied"));
   });
@@ -143,7 +147,17 @@ async function startRealCallbackListener(state: OneUseState): Promise<RealCallba
       finish(undefined, new Error("callback listener closed"));
       await closeServer();
     },
+    isListening: () => server.listening,
   };
+}
+function revokeOutcome(statusCode: number | undefined): "revoked" | "skipped" {
+  if (statusCode === 200) return "revoked";
+  return "skipped";
+}
+
+function revocationFailure(revocation: "revoked" | "skipped"): { passed: false; reason: string } | undefined {
+  if (revocation === "revoked") return undefined;
+  return { passed: false, reason: REAL_REVOCATION_ERROR };
 }
 
 function revokeRefreshToken(refreshToken: string): Promise<"revoked" | "skipped"> {
@@ -162,7 +176,7 @@ function revokeRefreshToken(refreshToken: string): Promise<"revoked" | "skipped"
       },
       (response) => {
         response.resume();
-        response.once("end", () => resolve(response.statusCode === 200 ? "revoked" : "skipped"));
+        response.once("end", () => resolve(revokeOutcome(response.statusCode)));
       },
     );
     revocationRequest.once("error", () => resolve("skipped"));
@@ -173,7 +187,7 @@ function revokeRefreshToken(refreshToken: string): Promise<"revoked" | "skipped"
   return promise;
 }
 
-async function writeRealEvidence(revocation: "revoked" | "skipped"): Promise<string> {
+async function writeRealEvidence(): Promise<string> {
   const evidence = {
     proof: "oauth",
     credential_shape_validated: true,
@@ -183,7 +197,7 @@ async function writeRealEvidence(revocation: "revoked" | "skipped"): Promise<str
     gmail_profile_address_resolved: true,
     refresh_token_issued: true,
     access_token_refresh_succeeded: true,
-    revocation,
+    revocation: "revoked",
   };
   await writeFile(REAL_EVIDENCE_PATH, `${JSON.stringify(evidence)}\n`, { encoding: "utf8", mode: 0o600 });
   return REAL_EVIDENCE_PATH;
@@ -344,33 +358,54 @@ function sendCallback(port: number, method: string, target: string): Promise<num
   });
 }
 
-async function exerciseListener(kind: "success" | "rejection" | "timeout"): Promise<{ closed: boolean; result: CallbackResult | undefined }> {
-  const state = new OneUseState();
-  const server = createServer();
-  let port = 0;
-  let timer: NodeJS.Timeout | undefined;
-  const terminal = new Promise<CallbackResult | undefined>((resolve) => {
-    const finish = (result: CallbackResult | undefined): void => {
-      if (timer) clearTimeout(timer);
-      server.close(() => resolve(result));
-    };
-    server.on("request", (incoming, response) => {
-      const result = validateCallbackRequest(incoming.method, incoming.url ?? "", buildRedirectUri(port), state);
-      response.statusCode = result.accepted ? 200 : 400;
-      response.end("synthetic callback");
-      finish(result);
+async function exerciseListener(kind: "success" | "timeout"): Promise<{ closed: boolean; result: CallbackResult | undefined }> {
+  if (kind === "timeout") {
+    const state = new OneUseState();
+    const server = createServer();
+    let port = 0;
+    let timer: NodeJS.Timeout | undefined;
+    const terminal = new Promise<CallbackResult | undefined>((resolve) => {
+      const finish = (result: CallbackResult | undefined): void => {
+        clearTimeout(timer);
+        server.close(() => resolve(result));
+      };
+      server.on("request", (incoming, response) => {
+        const result = validateCallbackRequest(incoming.method, incoming.url ?? "", buildRedirectUri(port), state);
+        response.statusCode = result.accepted ? 200 : 400;
+        response.end("synthetic callback");
+        finish(result);
+      });
+      timer = setTimeout(() => finish(undefined), 100);
     });
-    timer = setTimeout(() => finish(undefined), 100);
-  });
-  port = await listen(server);
-  const redirectUri = buildRedirectUri(port);
-  if (kind === "success") {
-    await sendCallback(port, "GET", `${CALLBACK_PATH}?code=synthetic-code&state=${encodeURIComponent(state.value)}`);
-  } else if (kind === "rejection") {
-    await sendCallback(port, "GET", `${CALLBACK_PATH}?code=synthetic-code&state=wrong-state`);
+    port = await listen(server);
+    const result = await terminal;
+    return { closed: server.listening === false, result };
   }
-  const result = await terminal;
-  return { closed: server.listening === false, result };
+
+  const state = new OneUseState("fixed-state");
+  const listener = await startRealCallbackListener(state);
+  try {
+    await sendCallback(listener.port, "GET", `${CALLBACK_PATH}?code=synthetic-code&state=${encodeURIComponent(state.value)}`);
+    const code = await listener.result;
+    return { closed: listener.isListening() === false, result: { accepted: true, code } };
+  } finally {
+    await listener.close();
+  }
+}
+
+async function exerciseRejectedListener(method: string, targetForPort: (port: number) => string): Promise<{ closed: boolean; status: number; reason: string }> {
+  const listener = await startRealCallbackListener(new OneUseState("fixed-state"));
+  try {
+    const reasonPromise = listener.result.then(
+      () => "callback unexpectedly accepted",
+      (error: unknown) => error instanceof Error ? error.message : "callback rejection was not an Error",
+    );
+    const status = await sendCallback(listener.port, method, targetForPort(listener.port));
+    const reason = await reasonPromise;
+    return { closed: listener.isListening() === false, status, reason };
+  } finally {
+    await listener.close();
+  }
 }
 export async function runRealOAuthProof(): Promise<RealAuthorizationResult> {
   let listener: RealCallbackListener | undefined;
@@ -421,10 +456,15 @@ export async function runRealOAuthProof(): Promise<RealAuthorizationResult> {
     const refreshed = await client.refreshAccessToken();
     assert.ok(typeof refreshed.credentials.access_token === "string" && refreshed.credentials.access_token.length > 0);
     const revocation = await revokeRefreshToken(refreshToken);
-    const evidence_path = await writeRealEvidence(revocation);
+    const failure = revocationFailure(revocation);
+    if (failure !== undefined) return failure;
+    const evidence_path = await writeRealEvidence();
     return { passed: true, evidence_path, revocation };
-  } catch {
-    throw new Error("real OAuth proof failed");
+  } catch (error) {
+    if (error instanceof Error && error.message === REAL_CREDENTIAL_ENV_ERROR) {
+      return { passed: false, reason: REAL_CREDENTIAL_ENV_ERROR };
+    }
+    return { passed: false, reason: "real OAuth proof failed" };
   } finally {
     await listener?.close();
   }
@@ -474,14 +514,35 @@ export async function runOAuthProof(): Promise<{ passed: true; terminalPaths: nu
   assert.deepEqual(denial, { accepted: true, error: "access_denied" });
 
   const successListener = await exerciseListener("success");
-  const rejectionListener = await exerciseListener("rejection");
   const timeoutListener = await exerciseListener("timeout");
   assert.equal(successListener.closed, true);
   assert.equal(successListener.result?.accepted, true);
-  assert.equal(rejectionListener.closed, true);
-  assert.equal(rejectionListener.result?.accepted, false);
   assert.equal(timeoutListener.closed, true);
   assert.equal(timeoutListener.result, undefined);
+
+  const rejectionCases: Array<[string, (port: number) => string]> = [
+    ["POST", () => `${CALLBACK_PATH}?code=x&state=fixed-state`],
+    ["GET", () => `/wrong?code=x&state=fixed-state`],
+    ["GET", (port) => `http://127.0.0.2:${port}${CALLBACK_PATH}?code=x&state=fixed-state`],
+    ["GET", () => `${CALLBACK_PATH}?code=x&state=wrong-state`],
+    ["GET", () => `${CALLBACK_PATH}?code=x&state=fixed-state&state=fixed-state`],
+    ["GET", () => `${CALLBACK_PATH}?code=x&state=`],
+    ["GET", () => `${CALLBACK_PATH}?code=x&code=y&state=fixed-state`],
+    ["GET", () => `${CALLBACK_PATH}?code=&state=fixed-state`],
+    ["GET", () => `${CALLBACK_PATH}?state=fixed-state`],
+    ["GET", () => `${CALLBACK_PATH}?code=x&error=access_denied&state=fixed-state`],
+    ["GET", () => `${CALLBACK_PATH}?error=&state=fixed-state`],
+  ];
+  for (const [method, targetForPort] of rejectionCases) {
+    const rejection = await exerciseRejectedListener(method, targetForPort);
+    assert.equal(rejection.status, 400);
+    assert.equal(rejection.reason, INVALID_CALLBACK_ERROR);
+    assert.equal(rejection.closed, true);
+  }
+  assert.equal(revokeOutcome(200), "revoked");
+  assert.equal(revokeOutcome(204), "skipped");
+  assert.equal(revokeOutcome(undefined), "skipped");
+  assert.deepEqual(revocationFailure("skipped"), { passed: false, reason: REAL_REVOCATION_ERROR });
 
   const captured: Array<Record<string, unknown>> = [];
   const tokenClient = new google.auth.OAuth2(SYNTHETIC_CLIENT_ID, undefined, fixture.redirectUri);
@@ -541,7 +602,12 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     const result = await runOAuthProof();
     console.error(JSON.stringify({ proof: "oauth", realAuthorization: "awaiting owner browser authorization" }));
     const realAuthorization = await runRealOAuthProof();
-    console.log(JSON.stringify({ proof: "oauth", ...result, realAuthorization }));
+    if (!realAuthorization.passed) {
+      console.error(JSON.stringify({ proof: "oauth", passed: false, error: realAuthorization.reason }));
+      process.exitCode = 1;
+    } else {
+      console.log(JSON.stringify({ proof: "oauth", ...result, realAuthorization }));
+    }
   } catch {
     console.error(JSON.stringify({ proof: "oauth", passed: false, error: "OAuth proof failed" }));
     process.exitCode = 1;
