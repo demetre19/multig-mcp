@@ -1,0 +1,33 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { runKeychainProof } from "../proofs/keychain.ts";
+import { runMcpProof } from "../proofs/mcp.ts";
+import { runOAuthProof } from "../proofs/oauth.ts";
+import { runMetadataProof } from "../proofs/metadata.ts";
+import { runMimeProof } from "../proofs/mime.ts";
+
+test("Keychain proof covers isolated records and cleanup", async () => {
+  const result = await runKeychainProof();
+  assert.equal(result.passed, true);
+  assert.ok(result.operations >= 10);
+});
+
+test("MCP proof covers protocol and diagnostic channels", async () => {
+  const result = await runMcpProof();
+  assert.deepEqual(result, { passed: true, scenarios: 3 });
+});
+
+test("OAuth proof covers local callback and token invariants", async () => {
+  const result = await runOAuthProof();
+  assert.deepEqual(result, { passed: true, terminalPaths: 3 });
+});
+
+test("metadata proof covers atomic and concurrent writes", async () => {
+  const result = await runMetadataProof();
+  assert.deepEqual(result, { passed: true, cases: 8 });
+});
+
+test("MIME proof covers bounded, normalized synthetic payloads", async () => {
+  const result = await runMimeProof();
+  assert.deepEqual(result, { passed: true, fixtures: 8 });
+});
