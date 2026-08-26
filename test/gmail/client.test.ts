@@ -1,0 +1,183 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import {
+  GmailClientError,
+  getMessage,
+  search,
+  type GmailApiClient,
+} from "../../dist/gmail/client.js";
+
+function encoded(text: string): string {
+  return Buffer.from(text, "utf8").toString("base64url");
+}
+
+function session(
+  list: (params: Record<string, unknown>) => Promise<unknown>,
+  get: (params: Record<string, unknown>) => Promise<unknown>,
+) {
+  return {
+    alias: "personal",
+    gmailClient: {
+      users: {
+        messages: { list, get },
+      },
+    } as unknown as GmailApiClient,
+  };
+}
+
+test("search consumes one bounded list page and fetches compact metadata per selected ID", async () => {
+  const listParams: Record<string, unknown>[] = [];
+  const getParams: Record<string, unknown>[] = [];
+  const gmail = session(
+    async (params) => {
+      listParams.push(params);
+      return {
+        data: {
+          messages: [
+            { id: "one", threadId: "thread-one" },
+            { id: "two", threadId: "thread-two" },
+            { id: "three", threadId: "thread-three" },
+          ],
+          nextPageToken: "must-not-be-consumed",
+        },
+      };
+    },
+    async (params) => {
+      getParams.push(params);
+      const id = params.id;
+      return {
+        data: {
+          id,
+          threadId: `thread-${id}`,
+          snippet: `snippet-${id}`,
+          payload: {
+            headers: [
+              { name: "From", value: "sender@example.test" },
+              { name: "To", value: "recipient@example.test" },
+              { name: "Cc", value: "copy@example.test" },
+              { name: "Subject", value: `subject-${id}` },
+              { name: "Date", value: "Tue, 01 Jan 2030 00:00:00 +0000" },
+            ],
+          },
+        },
+      };
+    },
+  );
+
+  const result = await search(gmail, { query: "from:example.test", limit: 2 });
+  assert.deepEqual(listParams, [{ userId: "me", q: "from:example.test", maxResults: 2 }]);
+  assert.deepEqual(getParams, [
+    { userId: "me", id: "one", format: "metadata", metadataHeaders: ["From", "To", "Cc", "Subject", "Date"] },
+    { userId: "me", id: "two", format: "metadata", metadataHeaders: ["From", "To", "Cc", "Subject", "Date"] },
+  ]);
+  assert.deepEqual(result, {
+    account: "personal",
+    messages: [
+      {
+        id: "one",
+        threadId: "thread-one",
+        snippet: "snippet-one",
+        from: "sender@example.test",
+        to: "recipient@example.test",
+        cc: "copy@example.test",
+        subject: "subject-one",
+        date: "Tue, 01 Jan 2030 00:00:00 +0000",
+      },
+      {
+        id: "two",
+        threadId: "thread-two",
+        snippet: "snippet-two",
+        from: "sender@example.test",
+        to: "recipient@example.test",
+        cc: "copy@example.test",
+        subject: "subject-two",
+        date: "Tue, 01 Jan 2030 00:00:00 +0000",
+      },
+    ],
+  });
+});
+
+test("search validates the query and limit bounds before contacting Gmail", async () => {
+  let calls = 0;
+  const gmail = session(
+    async () => {
+      calls += 1;
+      return { data: {} };
+    },
+    async () => ({ data: {} }),
+  );
+
+  for (const options of [
+    { query: "", limit: 10 },
+    { query: "in:anywhere", limit: 0 },
+    { query: "in:anywhere", limit: 51 },
+    { query: "in:anywhere", limit: 1.5 },
+  ]) {
+    await assert.rejects(search(gmail, options), (error: unknown) => {
+      return error instanceof GmailClientError && error.code === "invalid_gmail_query";
+    });
+  }
+  assert.equal(calls, 0);
+});
+
+test("getMessage requests full format and returns normalized content without raw payloads", async () => {
+  const params: Record<string, unknown>[] = [];
+  const gmail = session(
+    async () => ({ data: {} }),
+    async (request) => {
+      params.push(request);
+      return {
+        data: {
+          id: "message-1",
+          threadId: "thread-1",
+          internalDate: "1700000000000",
+          labelIds: ["INBOX"],
+          payload: {
+            mimeType: "text/plain",
+            headers: [{ name: "From", value: "sender@example.test" }],
+            body: { data: encoded("safe body") },
+          },
+          raw: "must not cross boundary",
+        },
+      };
+    },
+  );
+
+  const message = await getMessage(gmail, { messageId: "message-1" });
+  assert.deepEqual(params, [{ userId: "me", id: "message-1", format: "full" }]);
+  assert.equal(message.account, "personal");
+  assert.equal(message.textBody, "safe body");
+  assert.equal("raw" in message, false);
+});
+
+test("maps quota, invalid query, not found, transient, and network failures without exposing remote details", async () => {
+  const cases: Array<{ error: unknown; code: string }> = [
+    { error: { code: 429, message: "token=secret" }, code: "gmail_rate_limited" },
+    { error: { response: { status: 400, data: { error: { message: "Invalid query syntax for secret" } } } }, code: "invalid_gmail_query" },
+    { error: { response: { status: 404, data: { message: "private body" } } }, code: "message_not_found" },
+  ];
+
+  for (const scenario of cases) {
+    const gmail = session(async () => ({ data: { messages: [] } }), async () => { throw scenario.error; });
+    await assert.rejects(getMessage(gmail, { messageId: "message-1" }), (error: unknown) => {
+      return error instanceof GmailClientError && error.code === scenario.code && !error.message.includes("secret") && !error.message.includes("body");
+    });
+  }
+
+  let attempts = 0;
+  const temporary = session(
+    async () => {
+      attempts += 1;
+      if (attempts === 1) throw { response: { status: 503, data: { message: "credential=redacted" } } };
+      return { data: { messages: [] } };
+    },
+    async () => ({ data: {} }),
+  );
+  assert.deepEqual(await search(temporary, { query: "is:unread" }), { account: "personal", messages: [] });
+  assert.equal(attempts, 2);
+
+  const network = session(async () => { throw Object.assign(new Error("refresh token network detail"), { code: "ECONNRESET" }); }, async () => ({ data: {} }));
+  await assert.rejects(search(network, { query: "is:unread" }), (error: unknown) => {
+    return error instanceof GmailClientError && error.code === "network_failure" && !error.message.includes("refresh token");
+  });
+});
