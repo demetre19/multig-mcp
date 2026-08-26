@@ -18,13 +18,31 @@ function assertHeaderSafe(value: string): void {
   if (/[\r\n]/u.test(value)) throw new GmailComposeError();
 }
 
+const MAX_ENCODED_WORD_BYTES = 45;
+
 function encodedWord(value: string): string {
   return `=?UTF-8?B?${Buffer.from(value, "utf8").toString("base64")}?=`;
 }
 
 function encodeHeaderText(value: string): string {
   assertHeaderSafe(value);
-  return /[^\x00-\x7F]/u.test(value) ? encodedWord(value) : value;
+  if (!/[^\x00-\x7F]/u.test(value)) return value;
+
+  const words: string[] = [];
+  let chunk = "";
+  let chunkBytes = 0;
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (chunk.length > 0 && chunkBytes + characterBytes > MAX_ENCODED_WORD_BYTES) {
+      words.push(encodedWord(chunk));
+      chunk = "";
+      chunkBytes = 0;
+    }
+    chunk += character;
+    chunkBytes += characterBytes;
+  }
+  if (chunk.length > 0) words.push(encodedWord(chunk));
+  return words.join("\r\n ");
 }
 
 function encodeAddress(value: string): string {

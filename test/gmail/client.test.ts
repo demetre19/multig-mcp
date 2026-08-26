@@ -265,3 +265,80 @@ test("maps draft creation and draft sending to one alias and returns Gmail IDs",
   assert.deepEqual(sent, { account: "personal", messageId: "message-1", threadId: "thread-1" });
   assert.deepEqual(calls[1], { name: "drafts.send", params: { userId: "me", requestBody: { id: "draft-1" } } });
 });
+test("sends a composed message directly through users.messages.send and returns its alias and Gmail IDs", async () => {
+  let sendParams: Record<string, unknown> | undefined;
+  const gmail = {
+    alias: "personal",
+    scopes: [
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/gmail.compose",
+      "https://www.googleapis.com/auth/gmail.send",
+    ],
+    gmailClient: {
+      users: {
+        messages: {
+          async send(params: Record<string, unknown>) {
+            sendParams = params;
+            return { data: { id: "message-direct", threadId: "thread-result" } };
+          },
+        },
+        threads: {
+          async get(params: Record<string, unknown>) {
+            assert.deepEqual(params, {
+              userId: "me",
+              id: "thread-input",
+              format: "metadata",
+              metadataHeaders: ["Message-ID", "References"],
+            });
+            return {
+              data: {
+                messages: [{
+                  payload: {
+                    headers: [
+                      { name: "Message-ID", value: "<parent@example.test>" },
+                      { name: "References", value: "<root@example.test>" },
+                    ],
+                  },
+                }],
+              },
+            };
+          },
+        },
+      },
+    },
+  } as unknown as Parameters<typeof search>[0];
+
+  const result = await sendMessage(gmail, {
+    account: "personal",
+    to: ["recipient@example.test"],
+    cc: ["copy@example.test"],
+    subject: "subject",
+    body: "line one\nline two",
+    threadId: "thread-input",
+    confirm: true,
+  });
+
+  assert.deepEqual(result, {
+    account: "personal",
+    messageId: "message-direct",
+    threadId: "thread-result",
+  });
+  assert.deepEqual(sendParams, {
+    userId: "me",
+    requestBody: {
+      raw: encoded([
+        "To: recipient@example.test",
+        "Cc: copy@example.test",
+        "Subject: subject",
+        "In-Reply-To: <parent@example.test>",
+        "References: <root@example.test> <parent@example.test>",
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=UTF-8",
+        "Content-Transfer-Encoding: 8bit",
+        "",
+        "line one\r\nline two",
+      ].join("\r\n")),
+      threadId: "thread-input",
+    },
+  });
+});
