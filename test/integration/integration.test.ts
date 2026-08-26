@@ -52,6 +52,12 @@ test("CLI help stays on stdout and unknown commands stay on stderr", async () =>
   assert.equal(unknown.exitCode, 1);
   assert.equal(unknown.stdout, "");
   assert.match(unknown.stderr, /Usage:/u);
+
+  const unknownWithHelp = await runCli("not-a-command", "--help");
+  assert.equal(unknownWithHelp.exitCode, 1);
+  assert.equal(unknownWithHelp.stdout, "");
+  assert.match(unknownWithHelp.stderr, /Usage:/u);
+
   const invalidAuth = await runCli("auth", "list", "--unknown");
   assert.equal(invalidAuth.exitCode, 1);
   assert.equal(invalidAuth.stdout, "");

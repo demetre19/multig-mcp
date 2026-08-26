@@ -90,15 +90,25 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     return writeUsageError("invalid arguments");
   }
 
-  if (parsed.values.help === true) {
-    writeUsage();
-    return 0;
+  const [command, subcommand] = parsed.positionals;
+  if (command === undefined) {
+    if (!hasOnlyAllowedOptions(parsed.tokens, HELP_OPTIONS)) {
+      return writeUsageError("unknown command or arguments");
+    }
+    if (parsed.values.help === true) {
+      writeUsage();
+      return 0;
+    }
+    return writeUsageError("a command is required");
   }
 
-  const [command, subcommand] = parsed.positionals;
   if (command === "serve") {
     if (parsed.positionals.length !== 1 || !hasOnlyAllowedOptions(parsed.tokens, HELP_OPTIONS)) {
       return writeUsageError("unknown command or arguments");
+    }
+    if (parsed.values.help === true) {
+      writeUsage();
+      return 0;
     }
     try {
       await serveMcp(createAccountProvider());
@@ -114,10 +124,14 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     if (allowed === undefined || parsed.positionals.length !== 2 || !hasOnlyAllowedOptions(parsed.tokens, allowed)) {
       return writeUsageError("unknown command or arguments");
     }
+    if (parsed.values.help === true) {
+      writeUsage();
+      return 0;
+    }
     return authMain(args);
   }
 
-  return writeUsageError(command === undefined ? "a command is required" : "unknown command or arguments");
+  return writeUsageError("unknown command or arguments");
 }
 
 if (process.argv[1] !== undefined && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {

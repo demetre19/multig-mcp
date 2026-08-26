@@ -25,7 +25,7 @@ pnpm run build:keychain
 
 `--ignore-scripts` prevents dependency lifecycle scripts from running during installation. The native Keychain helper is compiled separately by `build:keychain` and is placed in `dist/native/`.
 
-The command above uses pnpm's normal user-owned store. Development on the originating workstation uses `/Volumes/TheHoneyBadger/pnpm-store`; other users should substitute an equivalent local store path rather than depending on that path:
+pnpm uses a user-owned store by default. If you need to choose a store location, use a portable path appropriate to your machine:
 
 ```bash
 pnpm install --frozen-lockfile --ignore-scripts --store-dir /path/to/pnpm-store
@@ -142,13 +142,23 @@ Gmail
 
 ## Troubleshooting and cleanup
 
-- `oauth_client_not_configured`: run `auth configure` with a valid Google Desktop OAuth JSON file.
-- `reauthorization_required`: run `auth reauthorize --alias <alias>` and complete Google's flow. Testing refresh-token expiry and the other Google causes listed above can require this.
-- `invalid_local_configuration`: check that the application configuration and Keychain records have not been manually altered, then reconfigure or reconnect the affected alias.
+| Contract code | Remediation |
+| --- | --- |
+| `unknown_account` | Run `pnpm multig-mcp auth list` and use an exact configured alias. If the alias is absent, connect it with `pnpm multig-mcp auth add --alias <alias>`. |
+| `oauth_client_not_configured` | Import a Google Desktop OAuth JSON file with `pnpm multig-mcp auth configure --credentials <path>`. |
+| `reauthorization_required` | Run `pnpm multig-mcp auth reauthorize --alias <alias>` and complete Google's flow. Testing refresh-token expiry and other Google causes can require this. |
+| `missing_scope` | Reauthorize the alias and grant `https://www.googleapis.com/auth/gmail.readonly`; if it is still missing, reconnect the alias after checking the OAuth consent-screen scopes. |
+| `invalid_gmail_query` | Use valid Gmail search syntax, provide a non-empty query, and keep the result limit between 1 and 50. |
+| `message_not_found` | Confirm the message ID belongs to the selected account and retry; search that account first if necessary. |
+| `gmail_rate_limited` | Wait before retrying and reduce request frequency or search limits; check Gmail API quota if the problem persists. |
+| `gmail_temporarily_unavailable` | Retry shortly; if Gmail remains unavailable, check Google's service status. |
+| `network_failure` | Check the network connection, DNS, firewall, and proxy settings, then retry the Gmail operation. |
+| `invalid_local_configuration` | Do not edit local metadata or Keychain records manually; inspect for mismatches, then reconfigure the OAuth client or reconnect the affected alias. |
+
 - A consent-screen warning or `access_denied` response usually means the account is not an allowed test user, the app's Google status has changed, or the requested restricted scope needs the applicable Google review.
 - If an MCP client reports a launch failure, verify that Node and `dist/cli.js` are absolute paths, that both build steps completed, and that the client is configured to start `serve`.
 
-To remove an account, use `auth remove`; this removes the local alias and its refresh token but does not revoke Google authorization. To fully clean up this installation, remove any remaining local configuration under the documented macOS Application Support location and remove the `multig-mcp.v1` records from macOS Keychain using Keychain Access. Remove the Google Cloud OAuth client separately if it is no longer needed. These cleanup actions are local or project-level actions and do not by themselves revoke every Google grant.
+To remove an account, use `auth remove`; this removes the local alias and its refresh token but does not revoke Google authorization. To uninstall this v1 installation, delete any remaining local configuration under `~/Library/Application Support/multig-mcp/` and delete the `multig-mcp.v1` records from macOS Keychain using Keychain Access. Remove the Google Cloud OAuth client separately if it is no longer needed. These cleanup actions are local or project-level actions and do not by themselves revoke every Google grant.
 
 ## Development checks
 
