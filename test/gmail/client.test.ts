@@ -150,9 +150,12 @@ test("getMessage requests full format and returns normalized content without raw
   assert.equal("raw" in message, false);
 });
 
-test("maps quota, invalid query, not found, transient, and network failures without exposing remote details", async () => {
+test("maps quota, permission, invalid query, not found, transient, and network failures without exposing remote details or adding retries over googleapis-common defaults", async () => {
   const cases: Array<{ error: unknown; code: string }> = [
     { error: { code: 429, message: "token=secret" }, code: "gmail_rate_limited" },
+    { error: { response: { status: 403, data: { error: { errors: [{ reason: "rateLimitExceeded" }] } } } }, code: "gmail_rate_limited" },
+    { error: { response: { status: 403, data: { error: { errors: [{ reason: "forbidden" }] } } } }, code: "invalid_local_configuration" },
+    { error: { response: { status: 403, data: { error: { errors: [{ reason: "insufficientPermissions" }] } } } }, code: "missing_scope" },
     { error: { response: { status: 400, data: { error: { message: "Invalid query syntax for secret" } } } }, code: "invalid_gmail_query" },
     { error: { response: { status: 404, data: { message: "private body" } } }, code: "message_not_found" },
   ];
@@ -164,17 +167,20 @@ test("maps quota, invalid query, not found, transient, and network failures with
     });
   }
 
-  let attempts = 0;
+  let dependencyAttempts = 0;
+  async function dependencyRequest(): Promise<unknown> {
+    dependencyAttempts += 1;
+    if (dependencyAttempts === 1) return dependencyRequest();
+    throw { response: { status: 503, data: { message: "credential=redacted" } } };
+  }
   const temporary = session(
-    async () => {
-      attempts += 1;
-      if (attempts === 1) throw { response: { status: 503, data: { message: "credential=redacted" } } };
-      return { data: { messages: [] } };
-    },
+    dependencyRequest,
     async () => ({ data: {} }),
   );
-  assert.deepEqual(await search(temporary, { query: "is:unread" }), { account: "personal", messages: [] });
-  assert.equal(attempts, 2);
+  await assert.rejects(search(temporary, { query: "is:unread" }), (error: unknown) => {
+    return error instanceof GmailClientError && error.code === "gmail_temporarily_unavailable";
+  });
+  assert.equal(dependencyAttempts, 2);
 
   const network = session(async () => { throw Object.assign(new Error("refresh token network detail"), { code: "ECONNRESET" }); }, async () => ({ data: {} }));
   await assert.rejects(search(network, { query: "is:unread" }), (error: unknown) => {

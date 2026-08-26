@@ -105,3 +105,16 @@ test("enforces the explicit body boundary with a deterministic marker", () => {
   assert.equal(DEFAULT_MAX_BODY_BYTES, 64 * 1024);
   assert.equal(normalized.textBody, `12345678\n${TRUNCATION_MARKER}`);
 });
+
+test("truncates non-ASCII content only at a valid UTF-8 boundary", () => {
+  const normalized = normalizeMime({
+    mimeType: "text/plain",
+    body: { data: encoded("é") },
+  }, 1);
+  const content = normalized.textBody === TRUNCATION_MARKER
+    ? ""
+    : normalized.textBody.slice(0, -(`\n${TRUNCATION_MARKER}`).length);
+
+  assert.equal(Buffer.byteLength(content, "utf8") <= 1, true);
+  assert.equal(normalized.textBody.includes("\uFFFD"), false);
+});

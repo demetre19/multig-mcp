@@ -58,7 +58,7 @@ export function decodeBase64UrlText(data: unknown, maxBytes: number): string | u
 
   try {
     const decoded = Buffer.from(data, "base64url");
-    if (decoded.byteLength > maxBytes) {
+    if (decoded.byteLength > maxBytes || utf8PrefixByteLength(decoded, decoded.byteLength) !== decoded.byteLength) {
       return undefined;
     }
     return decoded.toString("utf8");
@@ -67,13 +67,57 @@ export function decodeBase64UrlText(data: unknown, maxBytes: number): string | u
   }
 }
 
+function utf8PrefixByteLength(bytes: Uint8Array, maxBytes: number): number {
+  const limit = Math.min(bytes.byteLength, maxBytes);
+  let offset = 0;
+
+  while (offset < limit) {
+    const first = bytes[offset];
+    if (first === undefined) break;
+
+    let width: number;
+    if (first <= 0x7f) {
+      width = 1;
+    } else if (first >= 0xc2 && first <= 0xdf) {
+      width = 2;
+    } else if (first >= 0xe0 && first <= 0xef) {
+      width = 3;
+    } else if (first >= 0xf0 && first <= 0xf4) {
+      width = 4;
+    } else {
+      break;
+    }
+
+    if (offset + width > limit) break;
+    for (let index = 1; index < width; index += 1) {
+      const continuation = bytes[offset + index];
+      if (continuation === undefined || (continuation & 0xc0) !== 0x80) return offset;
+    }
+
+    const second = bytes[offset + 1];
+    if (
+      (width === 3 && second !== undefined && ((first === 0xe0 && second < 0xa0) || (first === 0xed && second > 0x9f))) ||
+      (width === 4 && second !== undefined && ((first === 0xf0 && second < 0x90) || (first === 0xf4 && second > 0x8f)))
+    ) {
+      break;
+    }
+    offset += width;
+  }
+
+  return offset;
+}
+
+function truncateUtf8Bytes(bytes: Uint8Array, maxBytes: number): string {
+  return Buffer.from(bytes.subarray(0, utf8PrefixByteLength(bytes, maxBytes))).toString("utf8");
+}
+
 function decodeBase64UrlPrefix(data: unknown, maxBytes: number): string | undefined {
   if (typeof data !== "string" || !/^[A-Za-z0-9_-]*$/u.test(data) || data.length % 4 === 1) {
     return undefined;
   }
   const encodedBytes = Math.min(data.length, Math.ceil(maxBytes / 3) * 4);
   try {
-    return Buffer.from(data.slice(0, encodedBytes), "base64url").subarray(0, maxBytes).toString("utf8");
+    return truncateUtf8Bytes(Buffer.from(data.slice(0, encodedBytes), "base64url"), maxBytes);
   } catch {
     return undefined;
   }
@@ -159,14 +203,13 @@ function appendBounded(candidate: TextCandidate, text: string, maxBodyBytes: num
     return;
   }
 
-  const textBytes = Buffer.byteLength(text, "utf8");
-  if (textBytes <= available) {
+  const textBytes = Buffer.from(text, "utf8");
+  if (textBytes.byteLength <= available) {
     candidate.text += separator + text;
     return;
   }
 
-  const prefix = Buffer.from(text, "utf8").subarray(0, available).toString("utf8");
-  candidate.text += separator + prefix;
+  candidate.text += separator + truncateUtf8Bytes(textBytes, available);
   candidate.truncated = true;
 }
 
@@ -225,9 +268,10 @@ export function normalizeMime(root: GmailMessagePart | null | undefined, maxBody
   const usingPlain = state.plain.text.length > 0 || state.plain.truncated;
   const selected = usingPlain ? state.plain : state.html;
   const selectedText = usingPlain ? selected.text : htmlToText(selected.text);
-  const selectedTruncated = selected.truncated || Buffer.byteLength(selectedText, "utf8") > maxBodyBytes;
-  const boundedText = selectedTruncated && Buffer.byteLength(selectedText, "utf8") > maxBodyBytes
-    ? Buffer.from(selectedText, "utf8").subarray(0, maxBodyBytes).toString("utf8")
+  const selectedBytes = Buffer.from(selectedText, "utf8");
+  const selectedTruncated = selected.truncated || selectedBytes.byteLength > maxBodyBytes;
+  const boundedText = selectedTruncated && selectedBytes.byteLength > maxBodyBytes
+    ? truncateUtf8Bytes(selectedBytes, maxBodyBytes)
     : selectedText;
   const textBody = boundedText.length > 0
     ? boundedText + (selectedTruncated || state.omittedBodyParts > 0 ? `\n${TRUNCATION_MARKER}` : "")
