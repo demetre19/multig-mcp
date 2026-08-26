@@ -16,7 +16,7 @@
     "build": "tsc",
     "build:keychain": "mkdir -p dist/native && xcrun --sdk macosx clang -std=c17 -Os -Wall -Wextra -Werror native/keychain-helper.c -framework Security -framework CoreFoundation -o dist/native/multig-keychain",
     "typecheck": "tsc --noEmit",
-    "test": "node --test",
+    "test": "node --test --experimental-strip-types test/gmail/client.test.ts test/gmail/mime.test.ts test/integration/integration.test.ts test/mcp/server.test.ts",
     "test:auth": "node --test --experimental-strip-types test/auth test/accounts test/storage",
     "test:mcp": "node --test --experimental-strip-types test/mcp test/gmail",
     "test:integration": "node --test --experimental-strip-types test/integration",
