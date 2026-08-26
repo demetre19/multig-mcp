@@ -4,9 +4,12 @@ import { createServer } from "node:http";
 import type { Server } from "node:http";
 import { Auth, google } from "googleapis";
 import { deferred } from "../storage/deferred.js";
-import { COMPOSE_SCOPE, GMAIL_SCOPES, READONLY_SCOPE, SEND_SCOPE } from "../storage/config.js";
+
+export const READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+export const COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose";
+export const SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send";
+export const GMAIL_SCOPES = [READONLY_SCOPE, COMPOSE_SCOPE, SEND_SCOPE] as const;
 export const CALLBACK_PATH = "/oauth2callback";
-export { COMPOSE_SCOPE, GMAIL_SCOPES, READONLY_SCOPE, SEND_SCOPE };
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
 
 type OAuthClient = Auth.OAuth2Client;

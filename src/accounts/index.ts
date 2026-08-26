@@ -166,24 +166,6 @@ export class AccountManager {
     return summaries;
   }
 
-  async getAccountScopes(aliasInput: string): Promise<string[]> {
-    let alias: string;
-    try {
-      alias = normalizeAlias(aliasInput);
-    } catch {
-      throw new AccountSessionError("unknown_account");
-    }
-    let config;
-    try {
-      config = await readConfig(this.configPath);
-    } catch {
-      throw new AccountSessionError("invalid_local_configuration");
-    }
-    const metadata = config.accounts[alias];
-    if (metadata === undefined) throw new AccountSessionError("unknown_account", alias);
-    if (!isUsableMetadata(metadata, alias)) throw new AccountSessionError("missing_scope", alias);
-    return [...metadata.scopes];
-  }
 
   async getAccountSession(aliasInput: string): Promise<AccountSession> {
     let alias: string;

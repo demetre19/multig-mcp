@@ -6,7 +6,8 @@ import { afterEach, describe, it } from "node:test";
 import { Auth } from "googleapis";
 import { AccountManager, AccountSessionError, mapGoogleError, redactSensitive } from "../../src/accounts/index.ts";
 import { addAccount, reauthorizeAccount, removeAccount } from "../../src/auth/lifecycle.ts";
-import { GMAIL_SCOPES, mutateConfig, READONLY_SCOPE } from "../../src/storage/config.ts";
+import { GMAIL_SCOPES } from "../../src/auth/oauth.ts";
+import { mutateConfig, READONLY_SCOPE } from "../../src/storage/config.ts";
 import { KeychainError, KeychainStore } from "../../src/storage/keychain.ts";
 
 const directories: string[] = [];

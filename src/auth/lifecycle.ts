@@ -11,13 +11,13 @@ import {
   mutateConfig,
   normalizeAlias,
   OAUTH_CLIENT_KEYCHAIN_ACCOUNT,
-  GMAIL_SCOPES,
   readConfig,
 } from "../storage/config.js";
 import { KeychainError, KeychainStore } from "../storage/keychain.js";
 import {
   OAuthFlowError,
   assertGrantedScopes,
+  GMAIL_SCOPES,
   runOAuthFlow,
   type OAuthClientCredentials,
   type OAuthFlowResult,

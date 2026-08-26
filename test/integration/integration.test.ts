@@ -12,13 +12,11 @@ import { AccountProviderError, type AccountProvider } from "../../dist/mcp/sessi
 import { createMultigServer } from "../../dist/mcp/server.js";
 import type { GmailApiClient } from "../../dist/gmail/client.js";
 import { KeychainStore } from "../../dist/storage/keychain.js";
+import { GMAIL_SCOPES } from "../../dist/auth/oauth.js";
 import {
-  COMPOSE_SCOPE,
-  GMAIL_SCOPES,
   KEYCHAIN_SERVICE,
   OAUTH_CLIENT_KEYCHAIN_ACCOUNT,
   READONLY_SCOPE,
-  SEND_SCOPE,
   keychainAccountForAlias,
   writeConfigAtomic,
 } from "../../dist/storage/config.js";

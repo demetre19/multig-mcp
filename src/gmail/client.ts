@@ -1,6 +1,6 @@
 import type { gmail_v1 } from "googleapis";
 import type { CreateDraftResult, DraftInput, SendInput, SendMessageResult, StructuredErrorCode } from "../contracts.js";
-import { COMPOSE_SCOPE, SEND_SCOPE } from "../storage/config.js";
+import { COMPOSE_SCOPE, SEND_SCOPE } from "../auth/oauth.js";
 import { buildRawMessage, GmailComposeError, type ThreadingHeaders } from "./compose.js";
 import { normalizeMessage, type NormalizedMessageData } from "./mime.js";
 
@@ -55,7 +55,7 @@ export interface GmailApiClient {
 }
 export interface GmailAliasSession {
   alias: string;
-  scopes: readonly string[];
+  scopes?: readonly string[];
   gmailClient: GmailApiClient;
 }
 

@@ -148,7 +148,12 @@ async function selectedSession(provider: AccountProvider, alias: string): Promis
   if (session.alias !== alias) {
     throw new AccountProviderError("unknown_account", "The account provider returned a different alias.", alias);
   }
-  return session;
+  if (session.scopes !== undefined) return session;
+  const account = (await provider.listAccounts()).find((candidate) => candidate.alias === alias);
+  if (account === undefined) {
+    throw new AccountProviderError("unknown_account", "The selected account alias is not configured.", alias);
+  }
+  return { ...session, scopes: [...account.scopes] };
 }
 
 function searchOutput(result: { account: string; messages: GmailSearchMessage[] }): Record<string, unknown> {
