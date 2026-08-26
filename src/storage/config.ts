@@ -8,6 +8,9 @@ export const CONFIG_VERSION = 1 as const;
 export const KEYCHAIN_SERVICE = "multig-mcp.v1";
 export const OAUTH_CLIENT_KEYCHAIN_ACCOUNT = "oauth-client";
 export const READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+export const COMPOSE_SCOPE = "https://www.googleapis.com/auth/gmail.compose";
+export const SEND_SCOPE = "https://www.googleapis.com/auth/gmail.send";
+export const GMAIL_SCOPES = [READONLY_SCOPE, COMPOSE_SCOPE, SEND_SCOPE] as const;
 
 export type AccountMetadata = {
   email: string;

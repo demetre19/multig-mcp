@@ -109,8 +109,7 @@ export function mapGoogleError(error: unknown, account?: string): AccountSession
 function isUsableMetadata(account: { scopes: string[]; keychainService: string; keychainAccount: string }, alias: string): boolean {
   return account.keychainService === KEYCHAIN_SERVICE
     && account.keychainAccount === keychainAccountForAlias(alias)
-    && account.scopes.length === 1
-    && account.scopes[0] === READONLY_SCOPE;
+    && account.scopes.includes(READONLY_SCOPE);
 }
 
 function tokenFromBuffer(buffer: Buffer | undefined, alias: string): string {
@@ -165,6 +164,25 @@ export class AccountManager {
       summaries.push({ alias, email: metadata.email, scopes: [...metadata.scopes], status });
     }
     return summaries;
+  }
+
+  async getAccountScopes(aliasInput: string): Promise<string[]> {
+    let alias: string;
+    try {
+      alias = normalizeAlias(aliasInput);
+    } catch {
+      throw new AccountSessionError("unknown_account");
+    }
+    let config;
+    try {
+      config = await readConfig(this.configPath);
+    } catch {
+      throw new AccountSessionError("invalid_local_configuration");
+    }
+    const metadata = config.accounts[alias];
+    if (metadata === undefined) throw new AccountSessionError("unknown_account", alias);
+    if (!isUsableMetadata(metadata, alias)) throw new AccountSessionError("missing_scope", alias);
+    return [...metadata.scopes];
   }
 
   async getAccountSession(aliasInput: string): Promise<AccountSession> {

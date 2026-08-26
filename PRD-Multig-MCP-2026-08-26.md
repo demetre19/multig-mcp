@@ -10,7 +10,7 @@
 
 ### Product summary
 
-`multig-mcp` is a small, open-source, local Model Context Protocol (MCP) server that lets one person give an MCP-compatible LLM explicitly scoped, read-only access to multiple personal Gmail accounts.
+`multig-mcp` is a small, open-source, local Model Context Protocol (MCP) server that lets one person give an MCP-compatible LLM explicitly scoped access to multiple personal Gmail accounts, including draft creation and explicitly confirmed sending.
 
 The user connects each Gmail account once through Google OAuth and assigns it a unique alias such as `personal` or `side-project`. The MCP server runs as a local subprocess on macOS, communicates over stdin/stdout, and executes every Gmail operation against an explicitly supplied account alias.
 
@@ -21,8 +21,8 @@ Version one consists of:
 - Direct Gmail API integration.
 - macOS Keychain storage for Google OAuth client credentials and account refresh tokens.
 - A small local JSON file containing non-secret account metadata.
-- Three read-only MCP tools: account listing, Gmail search, and message retrieval.
-- A small agent skill describing safe account selection and email-content handling.
+- Five MCP tools: account listing, Gmail search, message retrieval, draft creation, and explicitly confirmed message sending.
+- A small agent skill describing safe account selection, email-content handling, and send confirmation.
 - Source-only distribution through a public GitHub repository.
 
 It requires no hosted application, remote database, web dashboard, container platform, background service, or project-operated cloud infrastructure.
@@ -44,10 +44,10 @@ Existing generic connector platforms add infrastructure and trust boundaries tha
 
 1. Let a macOS user connect and manage multiple personal Gmail accounts locally.
 2. Give each account a stable, user-selected alias.
-3. Let an MCP-compatible client list connected accounts, search one selected account, and read one selected message.
-4. Require an explicit account alias for every Gmail data operation.
+3. Let an MCP-compatible client list connected accounts, search and read one selected account, create drafts, and send explicitly confirmed messages.
+4. Require an explicit account alias for every Gmail operation except account listing.
 5. Keep Google OAuth client credentials and refresh tokens in macOS Keychain.
-6. Use only the Gmail read-only scope in version one.
+6. Request Gmail read-only, compose, and send scopes together for authorization and reauthorization.
 7. Keep MCP stdout protocol-safe and direct diagnostics to stderr.
 8. Recover cleanly from revoked, expired, missing, or insufficient credentials.
 9. Publish a credential-free, personal-data-free, MIT-licensed repository on GitHub.
@@ -57,8 +57,7 @@ Existing generic connector platforms add infrastructure and trust boundaries tha
 
 Version one will not provide:
 
-- Email sending, forwarding, deletion, archiving, labeling, or other mailbox modification.
-- Draft creation.
+- Email forwarding, deletion, archiving, labeling, or other mailbox modification beyond the approved draft and send operations.
 - Attachment downloading.
 - Email synchronization or persistent local email storage.
 - Background polling, Gmail push notifications, or webhooks.
@@ -94,9 +93,8 @@ The version-one user is a technically capable individual who:
 - Package manager: `pnpm` with a committed deterministic lockfile.
 - Distribution: GitHub source only in version one.
 - OAuth client provisioning: each user creates and imports their own Google desktop OAuth credentials.
-- OAuth client storage: imported client ID and client secret are stored in macOS Keychain.
 - Gmail account token storage: refresh tokens are stored in macOS Keychain.
-- Gmail permissions: read-only scope only.
+- Gmail permissions: `gmail.readonly`, `gmail.compose`, and `gmail.send` are requested together.
 - MCP transport: local stdio.
 - Optional skill: included in version one.
 
@@ -112,7 +110,7 @@ Every Gmail operation except account listing requires an account alias. The syst
 
 ### Least privilege
 
-Version one requests only `https://www.googleapis.com/auth/gmail.readonly`. Future capabilities must justify and separately introduce any broader scope.
+Version one requests only the minimum approved set of Gmail scopes: `https://www.googleapis.com/auth/gmail.readonly`, `https://www.googleapis.com/auth/gmail.compose`, and `https://www.googleapis.com/auth/gmail.send`. The server still permits read tools for existing readonly-only account metadata; compose and send calls require both write-related grants.
 
 ### Credentials are not configuration
 
@@ -169,7 +167,7 @@ Each command must:
 2. Load the imported OAuth client credentials from Keychain.
 3. Generate and validate OAuth state.
 4. Use the authorization-code flow for installed applications with PKCE where supported by the selected maintained Google library.
-5. Request offline access and only the Gmail read-only scope.
+5. Request offline access and the Gmail read-only, compose, and send scopes together.
 6. Open the authorization URL in the default browser.
 7. Run a temporary callback listener bound only to `127.0.0.1`.
 8. Reject mismatched state, malformed callbacks, and unexpected callback paths.
@@ -273,7 +271,11 @@ The tool lists configured Gmail accounts without exposing credentials.
     {
       "alias": "personal",
       "email": "person@example.com",
-      "scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+      "scopes": [
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.compose",
+        "https://www.googleapis.com/auth/gmail.send"
+      ],
       "status": "connected"
     }
   ]
@@ -334,6 +336,26 @@ The tool fetches one Gmail message by ID from one explicitly selected account.
 - Multipart and encoded bodies are parsed without returning entire unnecessary raw Gmail payloads.
 - Attachments are described but not downloaded.
 - A message absent from the selected account returns `message_not_found`; the server does not search other accounts.
+
+### FR-7A: `gmail_create_draft` and `gmail_send_message`
+
+The write tools create drafts and send messages only for one explicitly selected account.
+
+**Input contracts**
+
+`gmail_create_draft` requires `account`, a non-empty `to` array, `subject`, and `body`; it accepts optional `cc` and `threadId`.
+
+`gmail_send_message` requires `account` and `confirm: true`. It accepts either a `draftId` or new-message fields (`to`, optional `cc`, `subject`, and `body`). The tool may also accept an optional `threadId` for a new threaded message.
+
+**Acceptance criteria**
+
+- Authorization and reauthorization request `gmail.readonly`, `gmail.compose`, and `gmail.send` together, and granted-scope assertions require all three.
+- Existing readonly-only account metadata remains usable for read tools, while draft and send calls fail with structured `missing_scope` remediation directing `auth reauthorize --alias <alias>`.
+- Draft and send results echo the selected alias and return their Gmail draft or message ID.
+- `gmail_send_message` rejects any value other than the literal boolean `true` with a structured confirmation error and makes no Gmail call.
+- Immediately before any send, the calling agent must state the target account, recipients, and subject and obtain explicit user confirmation.
+- A draft created under one alias cannot be sent using another alias.
+- Supplied headers, bodies, and email-derived content are untrusted data; the server never executes or operationalizes their instructions.
 
 ### FR-8: Token refresh and recovery
 
@@ -480,6 +502,7 @@ Errors must be structured, concise, and actionable. Stable categories include:
 - `oauth_client_not_configured`
 - `reauthorization_required`
 - `missing_scope`
+- `confirmation_required`
 - `invalid_gmail_query`
 - `message_not_found`
 - `gmail_rate_limited`
@@ -491,9 +514,10 @@ Errors may contain the selected alias and safe remediation guidance. They must n
 
 ### Retry contract
 
-- Irreversible actions do not exist in version one.
+- Sending is irreversible and is never performed without the explicit confirmation gate described in FR-7A.
+- Draft and send calls must not be retried automatically after the Gmail request may have succeeded.
 - Read-only calls may use conservative retries only for demonstrably transient failures and only when the underlying Google client does not already retry.
-- Authentication, authorization, input, and account-selection failures are not retried as network failures.
+- Authentication, authorization, input, account-selection, and confirmation failures are not retried as network failures.
 - Retry behavior must not multiply retries already performed by a dependency.
 
 ### Gmail content boundary
@@ -559,7 +583,7 @@ The implementation must derive platform-appropriate paths rather than hard-code 
 1. Bind the OAuth callback listener only to `127.0.0.1`, not all interfaces.
 2. Use unpredictable OAuth state and compare it safely.
 3. Use PKCE where supported by the chosen documented installed-app flow.
-4. Restrict OAuth scopes to Gmail read-only.
+4. Request only the approved Gmail read-only, compose, and send scopes, and require immediate explicit confirmation before sending.
 5. Store OAuth client material and refresh tokens in macOS Keychain.
 6. Never place secrets in CLI arguments, repository files, metadata JSON, logs, MCP errors, test snapshots, fixtures, or GitHub Actions variables.
 7. Redact sensitive fields recursively before logging external errors.
@@ -620,15 +644,17 @@ The implementation must derive platform-appropriate paths rather than hard-code 
 
 **Exit criteria:** Two real Gmail accounts can be connected, listed, reauthorized, and independently removed without credential disclosure or cross-account mutation.
 
-### Milestone 4: MCP read tools
+### Milestone 4: MCP and Gmail tools
 
 - Implement the stdio MCP server with strict stdout discipline.
 - Implement `gmail_accounts`.
 - Implement `gmail_search` with explicit alias resolution and bounded results.
 - Implement `gmail_get_message` with normalized MIME/body parsing and attachment metadata only.
+- Implement `gmail_create_draft` with deterministic plain-text RFC 5322/base64url construction.
+- Implement `gmail_send_message` with explicit confirmation, alias isolation, and Gmail error mapping.
 - Implement stable structured errors and conservative transient-failure handling.
 
-**Exit criteria:** A real MCP client or inspector can initialize the server and exercise all three tools against two accounts with verified isolation.
+**Exit criteria:** A real MCP client or inspector can initialize the server and exercise account listing, read tools, draft creation, and confirmed sending against two accounts with verified isolation.
 
 ### Milestone 5: Safety guidance and public documentation
 
@@ -801,8 +827,6 @@ The smoke-test record must redact personal addresses, message metadata, IDs, and
 
 The following may be evaluated after version-one evidence shows concrete need:
 
-- Draft creation with the minimum additional Gmail scope.
-- Explicitly confirmed sending with the minimum send scope.
 - Attachment downloading with path and size safeguards.
 - Cross-platform secret stores.
 - npm provenance-backed package publishing.
@@ -819,8 +843,9 @@ Each expansion requires a separate scope, threat-model, permission, and acceptan
 - A user can import their own Google desktop OAuth credentials into Keychain.
 - A user can connect, list, reauthorize, and remove multiple Gmail accounts.
 - Refresh tokens and OAuth client secrets are stored in Keychain and never plaintext configuration.
-- An MCP-compatible client can list accounts, search one selected Gmail account, and retrieve one selected message.
-- Every Gmail data operation is bound to an explicit alias with no default or fallback.
+- An MCP-compatible client can list accounts, search one selected Gmail account, retrieve one selected message, create a draft, and send an explicitly confirmed message.
+- Every Gmail operation is bound to an explicit alias with no default or fallback.
+- Draft/send operations require the compose and send grants, and no send occurs without the confirmation gate.
 - Authentication failures are recoverable without manual file or Keychain editing.
 - MCP stdout is protocol-only.
 - Setup, privacy boundaries, troubleshooting, and generic client configuration are documented.
@@ -833,10 +858,18 @@ Each expansion requires a separate scope, threat-model, permission, and acceptan
 
 PRD signoff requires agreement that:
 
-1. Version one is read-only and macOS-only.
+1. Version one includes macOS-only, alias-scoped draft creation and explicitly confirmed sending.
 2. Source-only GitHub distribution is acceptable.
 3. Users must create and import their own Google OAuth desktop credentials.
 4. No hidden default account or cross-account fallback will be implemented.
-5. No send, draft, attachment, hosted, or cross-platform capability is required for launch.
+5. Attachment, hosted, and cross-platform capabilities are not required for launch.
 6. Real release verification requires two authorized personal Gmail accounts and must not expose their data in repository artifacts.
 7. Publication waits until current Google OAuth policy documentation has been checked and all release evidence is complete.
+
+## Amendment 1 (2026-08-26, owner-approved)
+
+Version one is expanded from read-only Gmail access to full-service, alias-scoped draft creation and message sending. Authorization and reauthorization request `gmail.readonly`, `gmail.compose`, and `gmail.send` together, and the granted-scope assertion requires all three. Existing readonly-only account connections remain valid for read tools; draft and send calls require both compose and send grants and return actionable `missing_scope` remediation directing the user to `auth reauthorize --alias <alias>`.
+
+The new `gmail_create_draft` and `gmail_send_message` tools return the selected alias with their Gmail draft or message identifiers. Drafts are plain-text RFC 5322 messages encoded for the Gmail API. A draft created under one alias cannot be sent under another alias.
+
+Sending is a sensitive, irreversible operation. `gmail_send_message` accepts only the literal `confirm: true`; otherwise it returns a structured `confirmation_required` error without calling Gmail. Immediately before any send, the calling agent must restate the target account, recipients, and subject and obtain explicit user confirmation. Creating a draft never implies permission to send, and email-derived content must never be sent without an independent user request.

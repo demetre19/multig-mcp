@@ -4,9 +4,9 @@ import { createServer } from "node:http";
 import type { Server } from "node:http";
 import { Auth, google } from "googleapis";
 import { deferred } from "../storage/deferred.js";
-
-export const READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly";
+import { COMPOSE_SCOPE, GMAIL_SCOPES, READONLY_SCOPE, SEND_SCOPE } from "../storage/config.js";
 export const CALLBACK_PATH = "/oauth2callback";
+export { COMPOSE_SCOPE, GMAIL_SCOPES, READONLY_SCOPE, SEND_SCOPE };
 const DEFAULT_TIMEOUT_MS = 5 * 60_000;
 
 type OAuthClient = Auth.OAuth2Client;
@@ -25,7 +25,7 @@ export type OAuthTokens = {
 
 export type OAuthFlowResult = {
   email: string;
-  scopes: [typeof READONLY_SCOPE];
+  scopes: typeof GMAIL_SCOPES;
   refreshToken?: string;
 };
 
@@ -225,13 +225,14 @@ function openSystemBrowser(url: string): Promise<void> {
   return result.promise;
 }
 
-function assertExactReadonlyScope(scope: string | undefined): asserts scope is typeof READONLY_SCOPE {
-  if (scope?.trim().split(/\s+/u).length !== 1 || scope.trim() !== READONLY_SCOPE) {
+export function assertGrantedScopes(scope: string | undefined): asserts scope is string {
+  const granted = new Set(scope?.trim().split(/\s+/u).filter((value) => value.length > 0));
+  if (GMAIL_SCOPES.some((required) => !granted.has(required))) {
     throw new OAuthFlowError("missing_scope");
   }
 }
 
-export { assertExactReadonlyScope, openSystemBrowser };
+export { openSystemBrowser };
 
 async function exchangeCode(
   client: OAuthClient,
@@ -275,7 +276,7 @@ export async function runOAuthFlow(options: OAuthFlowOptions): Promise<OAuthFlow
       prompt: "consent",
       redirect_uri: redirectUri,
       response_type: "code",
-      scope: [READONLY_SCOPE],
+      scope: [...GMAIL_SCOPES],
       state: state.value,
     });
     try {
@@ -291,7 +292,7 @@ export async function runOAuthFlow(options: OAuthFlowOptions): Promise<OAuthFlow
     } catch {
       throw new OAuthFlowError("oauth_exchange_failed");
     }
-    assertExactReadonlyScope(tokens.scope);
+    assertGrantedScopes(tokens.scope);
     client.setCredentials(tokens);
     let email: string;
     try {
@@ -303,7 +304,7 @@ export async function runOAuthFlow(options: OAuthFlowOptions): Promise<OAuthFlow
     const refreshToken = typeof tokens.refresh_token === "string" && tokens.refresh_token.trim().length > 0
       ? tokens.refresh_token
       : undefined;
-    return { email, scopes: [READONLY_SCOPE], ...(refreshToken === undefined ? {} : { refreshToken }) };
+    return { email, scopes: GMAIL_SCOPES, ...(refreshToken === undefined ? {} : { refreshToken }) };
   } finally {
     await listener.close();
   }

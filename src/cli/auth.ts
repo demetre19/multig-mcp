@@ -75,8 +75,13 @@ export async function runAuthCommand(inputArgs: string[], options: AuthCommandOp
     }
     case "reauthorize": {
       const alias = requiredOption(args, "--alias");
+      const before = await listAuthAccounts(lifecycle);
       const result = await reauthorizeAccount(alias, lifecycle);
       io.writeLine(`Account reauthorized: ${alias} (${result.email}).`);
+      const normalizedAlias = alias.trim().toLowerCase();
+      const prior = before.find((account) => account.alias === normalizedAlias);
+      const addedScopes = result.scopes.filter((scope) => !(prior?.scopes.includes(scope) ?? false));
+      if (addedScopes.length > 0) io.writeLine(`New scopes granted: ${addedScopes.join(", ")}.`);
       return;
     }
     default:

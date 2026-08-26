@@ -1,5 +1,7 @@
 import type { gmail_v1 } from "googleapis";
-import type { StructuredErrorCode } from "../contracts.js";
+import type { CreateDraftResult, DraftInput, SendInput, SendMessageResult, StructuredErrorCode } from "../contracts.js";
+import { COMPOSE_SCOPE, SEND_SCOPE } from "../storage/config.js";
+import { buildRawMessage, GmailComposeError, type ThreadingHeaders } from "./compose.js";
 import { normalizeMessage, type NormalizedMessageData } from "./mime.js";
 
 export const DEFAULT_SEARCH_LIMIT = 10;
@@ -24,16 +26,36 @@ export interface GmailMessagesClient {
   get(
     params: gmail_v1.Params$Resource$Users$Messages$Get,
   ): Promise<{ data: gmail_v1.Schema$Message }>;
+  send(
+    params: gmail_v1.Params$Resource$Users$Messages$Send,
+  ): Promise<{ data: gmail_v1.Schema$Message }>;
+}
+
+export interface GmailDraftsClient {
+  create(
+    params: gmail_v1.Params$Resource$Users$Drafts$Create,
+  ): Promise<{ data: gmail_v1.Schema$Draft }>;
+  send(
+    params: gmail_v1.Params$Resource$Users$Drafts$Send,
+  ): Promise<{ data: gmail_v1.Schema$Message }>;
+}
+
+export interface GmailThreadsClient {
+  get(
+    params: gmail_v1.Params$Resource$Users$Threads$Get,
+  ): Promise<{ data: gmail_v1.Schema$Thread }>;
 }
 
 export interface GmailApiClient {
   users: {
     messages: GmailMessagesClient;
+    drafts: GmailDraftsClient;
+    threads: GmailThreadsClient;
   };
 }
-
 export interface GmailAliasSession {
   alias: string;
+  scopes: readonly string[];
   gmailClient: GmailApiClient;
 }
 
@@ -41,6 +63,7 @@ export interface GmailSearchOptions {
   query: string;
   limit?: number;
 }
+
 
 export interface GmailSearchMessage {
   id: string;
@@ -146,7 +169,7 @@ function mapGmailError(error: unknown, alias: string): GmailClientError {
       return new GmailClientError("gmail_rate_limited", "Gmail temporarily rejected the request because of quota or rate limits.", alias);
     }
     if (reasons.some((reason) => MISSING_SCOPE_ERROR_REASONS.has(reason))) {
-      return new GmailClientError("missing_scope", "The selected account does not grant the required Gmail read-only scope.", alias);
+      return new GmailClientError("missing_scope", `The selected account does not grant the required Gmail scope. Run auth reauthorize --alias ${alias}.`, alias);
     }
     return new GmailClientError("invalid_local_configuration", "The local account configuration is invalid.", alias);
   }
@@ -175,6 +198,145 @@ async function requestOnce<T>(alias: string, request: () => Promise<T>): Promise
   } catch (error) {
     throw mapGmailError(error, alias);
   }
+}
+const draftOwners = new Map<string, string>();
+
+function requireScopes(aliasSession: GmailAliasSession, required: readonly string[]): void {
+  const granted = new Set(aliasSession.scopes ?? []);
+  if (required.every((scope) => granted.has(scope))) return;
+  throw new GmailClientError(
+    "missing_scope",
+    `The selected account does not grant the required Gmail compose and send scopes. Run auth reauthorize --alias ${aliasSession.alias}.`,
+    aliasSession.alias,
+  );
+}
+
+function composeInput(alias: string, input: {
+  to?: string[];
+  cc?: string[];
+  subject?: string;
+  body?: string;
+}): { to: string[]; cc?: string[]; subject: string; body: string } {
+  if (!Array.isArray(input.to) || input.to.length === 0
+    || typeof input.subject !== "string" || typeof input.body !== "string") {
+    throw new GmailClientError("invalid_local_configuration", "The message input is incomplete.", alias);
+  }
+  return {
+    to: input.to,
+    ...(input.cc === undefined ? {} : { cc: input.cc }),
+    subject: input.subject,
+    body: input.body,
+  };
+}
+
+async function threadHeaders(aliasSession: GmailAliasSession, threadId: string): Promise<ThreadingHeaders> {
+  const response = await requestOnce(aliasSession.alias, () => aliasSession.gmailClient.users.threads.get({
+    userId: "me",
+    id: threadId,
+    format: "metadata",
+    metadataHeaders: ["Message-ID", "References"],
+  }));
+  const firstMessage = response.data.messages?.[0];
+  if (firstMessage === undefined) return {};
+  const messageId = headerValue(firstMessage, "Message-ID");
+  const references = headerValue(firstMessage, "References");
+  return {
+    ...(messageId === undefined ? {} : { messageId }),
+    ...(references === undefined ? {} : { references }),
+  };
+}
+function composeRaw(alias: string, input: {
+  to?: string[];
+  cc?: string[];
+  subject?: string;
+  body?: string;
+}, threading: ThreadingHeaders | undefined): string {
+  try {
+    return buildRawMessage(composeInput(alias, input), threading);
+  } catch (error) {
+    if (error instanceof GmailClientError) throw error;
+    if (error instanceof GmailComposeError) {
+      throw new GmailClientError("invalid_local_configuration", "The message input is invalid.", alias);
+    }
+    throw error;
+  }
+}
+
+function responseId(value: string | null | undefined, alias: string, kind: string): string {
+  if (typeof value === "string" && value.length > 0) return value;
+  throw new GmailClientError("network_failure", `Gmail did not return a ${kind} ID.`, alias);
+}
+
+export async function createDraft(aliasSession: GmailAliasSession, input: DraftInput): Promise<CreateDraftResult> {
+  requireScopes(aliasSession, [COMPOSE_SCOPE, SEND_SCOPE]);
+  const parentHeaders = input.threadId === undefined
+    ? undefined
+    : await threadHeaders(aliasSession, input.threadId);
+  const raw = composeRaw(aliasSession.alias, input, parentHeaders);
+  const response = await requestOnce(aliasSession.alias, () => aliasSession.gmailClient.users.drafts.create({
+    userId: "me",
+    requestBody: {
+      message: {
+        raw,
+        ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+      },
+    },
+  }));
+  const draftId = responseId(response.data.id, aliasSession.alias, "draft");
+  draftOwners.set(draftId, aliasSession.alias);
+  const returnedThreadId = response.data.message?.threadId;
+  return {
+    account: aliasSession.alias,
+    draftId,
+    ...(typeof returnedThreadId === "string"
+      ? { threadId: returnedThreadId }
+      : input.threadId === undefined ? {} : { threadId: input.threadId }),
+  };
+}
+
+export async function sendMessage(aliasSession: GmailAliasSession, input: SendInput): Promise<SendMessageResult> {
+  if (input.confirm !== true) {
+    throw new GmailClientError("confirmation_required", "Explicit confirmation is required immediately before sending.", aliasSession.alias);
+  }
+  requireScopes(aliasSession, [COMPOSE_SCOPE, SEND_SCOPE]);
+  const draftId = input.draftId;
+  if (draftId !== undefined) {
+    const owner = draftOwners.get(draftId);
+    if (owner !== undefined && owner !== aliasSession.alias) {
+      throw new GmailClientError("message_not_found", "The requested Gmail draft was not found in the selected account.", aliasSession.alias);
+    }
+    const response = await requestOnce(aliasSession.alias, () => aliasSession.gmailClient.users.drafts.send({
+      userId: "me",
+      requestBody: { id: draftId },
+    }));
+    const messageId = responseId(response.data.id, aliasSession.alias, "message");
+    draftOwners.delete(draftId);
+    return {
+      account: aliasSession.alias,
+      messageId,
+      ...(typeof response.data.threadId === "string" ? { threadId: response.data.threadId } : {}),
+    };
+  }
+  const parentHeaders = input.threadId === undefined
+    ? undefined
+    : await threadHeaders(aliasSession, input.threadId);
+  const raw = composeRaw(aliasSession.alias, input, parentHeaders);
+  const response = await requestOnce(aliasSession.alias, () => aliasSession.gmailClient.users.messages.send({
+    userId: "me",
+    requestBody: {
+      raw,
+      ...(input.threadId === undefined ? {} : { threadId: input.threadId }),
+    },
+  }));
+  const messageId = responseId(response.data.id, aliasSession.alias, "message");
+  const returnedThreadId = response.data.threadId;
+  return {
+    account: aliasSession.alias,
+    messageId,
+    ...(typeof returnedThreadId === "string"
+      ? { threadId: returnedThreadId }
+      : input.threadId === undefined ? {} : { threadId: input.threadId }),
+  };
 }
 
 

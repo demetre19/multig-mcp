@@ -14,7 +14,9 @@ import {
   AuthLifecycleError,
 } from "../../src/auth/lifecycle.ts";
 import {
+  assertGrantedScopes,
   buildRedirectUri,
+  GMAIL_SCOPES,
   READONLY_SCOPE,
   runOAuthFlow,
   OneUseState,
@@ -71,7 +73,7 @@ function clientFile() {
 function successfulFlow(email: string, refreshToken: string | undefined): (credentials: { clientId: string; clientSecret: string }, alias: string) => Promise<OAuthFlowResult> {
   return async () => ({
     email,
-    scopes: [READONLY_SCOPE],
+    scopes: GMAIL_SCOPES,
     ...(refreshToken === undefined ? {} : { refreshToken }),
   });
 }
@@ -85,6 +87,13 @@ describe("OAuth callback and PKCE", () => {
     const otherState = new OneUseState("state-value");
     assert.equal(validateCallbackRequest("GET", `http://localhost:43123/oauth2callback?state=state-value&code=code`, redirect, otherState).accepted, false);
     assert.equal(validateCallbackRequest("POST", `${redirect}?state=state-value&code=code`, redirect, new OneUseState("state-value")).accepted, false);
+  });
+
+  it("rejects readonly-only grants for authorization that must support compose and send", () => {
+    assert.throws(
+      () => assertGrantedScopes(READONLY_SCOPE),
+      (error: unknown) => error instanceof Error && "code" in error && error.code === "missing_scope",
+    );
   });
 
   it("runs the loopback flow with exact scope and Gmail identity seams", async () => {
@@ -101,7 +110,7 @@ describe("OAuth callback and PKCE", () => {
         authorization = options;
         return "https://accounts.google.test/authorize";
       },
-      async getToken() { return { tokens: { scope: READONLY_SCOPE, refresh_token: "refresh-token" } }; },
+      async getToken() { return { tokens: { scope: GMAIL_SCOPES.join(" "), refresh_token: "refresh-token" } }; },
     };
     const result = await runOAuthFlow({
       clientId: "client-id",
@@ -123,16 +132,16 @@ describe("OAuth callback and PKCE", () => {
       },
       exchangeCode: async (_client, code, verifier, redirectUri) => {
         exchanged = { code, verifier, redirectUri };
-        return { scope: READONLY_SCOPE, refresh_token: "refresh-token", access_token: "access-token", expiry_date: 123 };
+        return { scope: GMAIL_SCOPES.join(" "), refresh_token: "refresh-token", access_token: "access-token", expiry_date: 123 };
       },
       fetchProfile: async (client) => {
         profileCredentials = { ...client.credentials } as Record<string, unknown>;
         return "owner@example.test";
       },
     });
-    assert.deepEqual(result, { email: "owner@example.test", scopes: [READONLY_SCOPE], refreshToken: "refresh-token" });
+    assert.deepEqual(result, { email: "owner@example.test", scopes: GMAIL_SCOPES, refreshToken: "refresh-token" });
     assert.deepEqual(profileCredentials, {
-      scope: READONLY_SCOPE,
+      scope: GMAIL_SCOPES.join(" "),
       refresh_token: "refresh-token",
       access_token: "access-token",
       expiry_date: 123,
@@ -140,7 +149,7 @@ describe("OAuth callback and PKCE", () => {
     assert.equal(authorization?.access_type, "offline");
     assert.equal(authorization?.prompt, "consent");
     assert.equal(authorization?.code_challenge_method, "S256");
-    assert.deepEqual(authorization?.scope, [READONLY_SCOPE]);
+    assert.deepEqual(authorization?.scope, [...GMAIL_SCOPES]);
     assert.deepEqual(exchanged, { code: "authorization-code", verifier: "verifier", redirectUri: authorization?.redirect_uri });
   });
   it("closes callback listeners on browser and exchange terminal paths", async () => {

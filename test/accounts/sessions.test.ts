@@ -6,7 +6,7 @@ import { afterEach, describe, it } from "node:test";
 import { Auth } from "googleapis";
 import { AccountManager, AccountSessionError, mapGoogleError, redactSensitive } from "../../src/accounts/index.ts";
 import { addAccount, reauthorizeAccount, removeAccount } from "../../src/auth/lifecycle.ts";
-import { mutateConfig, READONLY_SCOPE } from "../../src/storage/config.ts";
+import { GMAIL_SCOPES, mutateConfig, READONLY_SCOPE } from "../../src/storage/config.ts";
 import { KeychainError, KeychainStore } from "../../src/storage/keychain.ts";
 
 const directories: string[] = [];
@@ -128,7 +128,7 @@ describe("account session contract", () => {
     const configPath = join(directory, "config.json");
     const keychain = new MemoryKeychain();
     await keychain.createOAuthClient(JSON.stringify({ clientId: "client-id", clientSecret: "client-secret" }));
-    const flow = (refreshToken: string) => async () => ({ email: "owner@example.test", scopes: [READONLY_SCOPE], refreshToken });
+    const flow = (refreshToken: string) => async () => ({ email: "owner@example.test", scopes: GMAIL_SCOPES, refreshToken });
     await addAccount("personal", { configPath, keychain, oauthFlow: flow("old-refresh") });
     const clients: Array<{ initialRefreshToken?: string }> = [];
     const manager = new AccountManager({ configPath, keychain }, {
@@ -167,7 +167,7 @@ describe("account session contract", () => {
     const configPath = join(directory, "config.json");
     const keychain = new MemoryKeychain();
     await keychain.createOAuthClient(JSON.stringify({ clientId: "client-id", clientSecret: "client-secret" }));
-    await addAccount("personal", { configPath, keychain, oauthFlow: async () => ({ email: "owner@example.test", scopes: [READONLY_SCOPE], refreshToken: "old-refresh" }) });
+    await addAccount("personal", { configPath, keychain, oauthFlow: async () => ({ email: "owner@example.test", scopes: GMAIL_SCOPES, refreshToken: "old-refresh" }) });
     keychain.failRefreshReplacement = true;
     let tokenListener: ((tokens: { access_token: string; expiry_date: number; refresh_token: string }) => void) | undefined;
     const client = {

@@ -11,12 +11,13 @@ import {
   mutateConfig,
   normalizeAlias,
   OAUTH_CLIENT_KEYCHAIN_ACCOUNT,
-  READONLY_SCOPE,
+  GMAIL_SCOPES,
   readConfig,
 } from "../storage/config.js";
 import { KeychainError, KeychainStore } from "../storage/keychain.js";
 import {
   OAuthFlowError,
+  assertGrantedScopes,
   runOAuthFlow,
   type OAuthClientCredentials,
   type OAuthFlowResult,
@@ -89,15 +90,15 @@ async function readClientCredentials(keychain: KeychainStore): Promise<OAuthClie
   }
 }
 
-function accountMetadata(alias: string, email: string): {
+function accountMetadata(alias: string, email: string, scopes: typeof GMAIL_SCOPES): {
   email: string;
-  scopes: [typeof READONLY_SCOPE];
+  scopes: string[];
   keychainService: typeof KEYCHAIN_SERVICE;
   keychainAccount: string;
 } {
   return {
     email,
-    scopes: [READONLY_SCOPE],
+    scopes: [...scopes],
     keychainService: KEYCHAIN_SERVICE,
     keychainAccount: keychainAccountForAlias(alias),
   };
@@ -119,15 +120,24 @@ async function executeOAuth(
   alias: string,
   options: AuthLifecycleOptions,
 ): Promise<OAuthFlowResult> {
-  if (options.oauthFlow !== undefined) return options.oauthFlow(credentials, alias);
+  let result: OAuthFlowResult;
   try {
-    return await runOAuthFlow(credentials);
+    result = options.oauthFlow === undefined
+      ? await runOAuthFlow(credentials)
+      : await options.oauthFlow(credentials, alias);
   } catch (error) {
     if (error instanceof OAuthFlowError) throw error;
+    if (error instanceof AuthLifecycleError) throw error;
     throw new AuthLifecycleError("oauth_failed", alias);
   }
+  try {
+    assertGrantedScopes(result.scopes.join(" "));
+  } catch (error) {
+    if (error instanceof OAuthFlowError) throw error;
+    throw new AuthLifecycleError("invalid_local_configuration", alias);
+  }
+  return result;
 }
-
 export async function configureOAuthClient(
   credentialsPath: string,
   options: AuthLifecycleOptions & { replace?: boolean } = {},
@@ -174,7 +184,7 @@ export async function addAccount(aliasInput: string, options: AuthLifecycleOptio
     created = true;
     await mutateConfig(configPath, (current) => {
       if (current.accounts[alias] !== undefined) throw new AuthLifecycleError("account_alias_exists", alias);
-      current.accounts[alias] = accountMetadata(alias, result.email);
+      current.accounts[alias] = accountMetadata(alias, result.email, result.scopes);
     });
   } catch (error) {
     if (created) await keychain.deleteAccountRefreshToken(alias, true).catch(() => undefined);
@@ -230,7 +240,7 @@ export async function reauthorizeAccount(aliasInput: string, options: AuthLifecy
   }
   await mutateConfig(configPath, (current) => {
     if (current.accounts[alias] === undefined) throw new AuthLifecycleError("unknown_account", alias);
-    current.accounts[alias] = accountMetadata(alias, result.email);
+    current.accounts[alias] = accountMetadata(alias, result.email, result.scopes);
   });
   invalidateAccountSession(configPath, alias);
   return result;

@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  createDraft,
   GmailClientError,
   getMessage,
   search,
+  sendMessage,
   type GmailApiClient,
 } from "../../dist/gmail/client.js";
 
@@ -186,4 +188,80 @@ test("maps quota, permission, invalid query, not found, transient, and network f
   await assert.rejects(search(network, { query: "is:unread" }), (error: unknown) => {
     return error instanceof GmailClientError && error.code === "network_failure" && !error.message.includes("refresh token");
   });
+});
+
+test("blocks draft creation for readonly-only sessions with actionable scope remediation", async () => {
+  let calls = 0;
+  const gmail = session(
+    async () => ({ data: {} }),
+    async () => ({ data: {} }),
+  );
+  await assert.rejects(
+    createDraft(gmail, { account: "personal", to: ["recipient@example.test"], subject: "subject", body: "body" }),
+    (error: unknown) => error instanceof GmailClientError
+      && error.code === "missing_scope"
+      && error.message.includes("auth reauthorize --alias personal"),
+  );
+  await assert.rejects(
+    sendMessage(gmail, { account: "personal", draftId: "draft-1", confirm: true }),
+    (error: unknown) => error instanceof GmailClientError && error.code === "missing_scope",
+  );
+  assert.equal(calls, 0);
+});
+
+test("maps draft creation and draft sending to one alias and returns Gmail IDs", async () => {
+  const calls: Array<{ name: string; params: Record<string, unknown> }> = [];
+  const gmail = {
+    alias: "personal",
+    scopes: [
+      "https://www.googleapis.com/auth/gmail.readonly",
+      "https://www.googleapis.com/auth/gmail.compose",
+      "https://www.googleapis.com/auth/gmail.send",
+    ],
+    gmailClient: {
+      users: {
+        messages: {
+          async list() { return { data: {} }; },
+          async get() { return { data: {} }; },
+          async send(params: Record<string, unknown>) {
+            calls.push({ name: "messages.send", params });
+            return { data: { id: "message-2", threadId: "thread-2" } };
+          },
+        },
+        drafts: {
+          async create(params: Record<string, unknown>) {
+            calls.push({ name: "drafts.create", params });
+            return { data: { id: "draft-1", message: { threadId: "thread-1" } } };
+          },
+          async send(params: Record<string, unknown>) {
+            calls.push({ name: "drafts.send", params });
+            return { data: { id: "message-1", threadId: "thread-1" } };
+          },
+        },
+        threads: {
+          async get() { return { data: { messages: [] } }; },
+        },
+      },
+    },
+  } as unknown as Parameters<typeof search>[0];
+
+  const draft = await createDraft(gmail, {
+    account: "personal",
+    to: ["recipient@example.test"],
+    subject: "subject",
+    body: "body",
+  });
+  assert.deepEqual(draft, { account: "personal", draftId: "draft-1", threadId: "thread-1" });
+  const createCall = calls[0];
+  assert.equal(createCall?.name, "drafts.create");
+  const requestBody = createCall?.params.requestBody as { message?: { raw?: string } } | undefined;
+  const raw = requestBody?.message?.raw;
+  assert.equal(typeof raw, "string");
+  const decoded = Buffer.from(raw as string, "base64url").toString("utf8");
+  assert.match(decoded, /^To: recipient@example\.test\r\nSubject: subject\r\n/u);
+  assert.match(decoded, /\r\n\r\nbody$/u);
+
+  const sent = await sendMessage(gmail, { account: "personal", draftId: "draft-1", confirm: true });
+  assert.deepEqual(sent, { account: "personal", messageId: "message-1", threadId: "thread-1" });
+  assert.deepEqual(calls[1], { name: "drafts.send", params: { userId: "me", requestBody: { id: "draft-1" } } });
 });

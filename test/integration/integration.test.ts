@@ -13,9 +13,12 @@ import { createMultigServer } from "../../dist/mcp/server.js";
 import type { GmailApiClient } from "../../dist/gmail/client.js";
 import { KeychainStore } from "../../dist/storage/keychain.js";
 import {
+  COMPOSE_SCOPE,
+  GMAIL_SCOPES,
   KEYCHAIN_SERVICE,
   OAUTH_CLIENT_KEYCHAIN_ACCOUNT,
   READONLY_SCOPE,
+  SEND_SCOPE,
   keychainAccountForAlias,
   writeConfigAtomic,
 } from "../../dist/storage/config.js";
@@ -92,6 +95,26 @@ function gmailClientFor(alias: string, calls: string[]): GmailApiClient {
             },
           };
         },
+        async send() {
+          calls.push(`${alias}:messages.send`);
+          return { data: { id: `${alias}-sent`, threadId: `${alias}-thread` } };
+        },
+      },
+      drafts: {
+        async create() {
+          calls.push(`${alias}:drafts.create`);
+          return { data: { id: `${alias}-draft`, message: { threadId: `${alias}-thread` } } };
+        },
+        async send() {
+          calls.push(`${alias}:drafts.send`);
+          return { data: { id: `${alias}-sent`, threadId: `${alias}-thread` } };
+        },
+      },
+      threads: {
+        async get() {
+          calls.push(`${alias}:threads.get`);
+          return { data: { messages: [] } };
+        },
       },
     },
   };
@@ -101,8 +124,8 @@ function isolatedProvider(calls: string[]): AccountProvider {
   return {
     async listAccounts() {
       return [
-        { alias: "alpha", email: "alpha@example.test", scopes: [READONLY_SCOPE], status: "connected" },
-        { alias: "beta", email: "beta@example.test", scopes: [READONLY_SCOPE], status: "connected" },
+        { alias: "alpha", email: "alpha@example.test", scopes: [...GMAIL_SCOPES], status: "connected" },
+        { alias: "beta", email: "beta@example.test", scopes: [...GMAIL_SCOPES], status: "connected" },
       ];
     },
     async openSession(alias: string) {
@@ -110,7 +133,11 @@ function isolatedProvider(calls: string[]): AccountProvider {
       if (alias !== "alpha" && alias !== "beta") {
         throw new AccountProviderError("unknown_account", "provider detail contains a secret", alias);
       }
-      return { alias, gmailClient: gmailClientFor(alias, calls) };
+      return {
+        alias,
+        scopes: [...GMAIL_SCOPES],
+        gmailClient: gmailClientFor(alias, calls),
+      };
     },
   };
 }
@@ -131,8 +158,8 @@ test("MCP account, search, and get-message flow preserves alias isolation", asyn
     const accounts = await client.callTool({ name: "gmail_accounts", arguments: {} });
     assert.deepEqual(accounts.structuredContent, {
       accounts: [
-        { alias: "alpha", email: "alpha@example.test", scopes: [READONLY_SCOPE], status: "connected" },
-        { alias: "beta", email: "beta@example.test", scopes: [READONLY_SCOPE], status: "connected" },
+        { alias: "alpha", email: "alpha@example.test", scopes: [...GMAIL_SCOPES], status: "connected" },
+        { alias: "beta", email: "beta@example.test", scopes: [...GMAIL_SCOPES], status: "connected" },
       ],
     });
 
@@ -152,6 +179,39 @@ test("MCP account, search, and get-message flow preserves alias isolation", asyn
     assert.equal(alphaMessage.structuredContent.account, "alpha");
     assert.equal(alphaMessage.structuredContent.textBody, "alpha body");
     assert.equal(alphaMessage.structuredContent.textBody === "beta body", false);
+    const draft = await client.callTool({
+      name: "gmail_create_draft",
+      arguments: { account: "alpha", to: ["recipient@example.test"], subject: "subject", body: "body" },
+    });
+    assert.deepEqual(draft.structuredContent, { account: "alpha", draftId: "alpha-draft", threadId: "alpha-thread" });
+
+    const missingConfirmation = await client.callTool({
+      name: "gmail_send_message",
+      arguments: { account: "alpha", draftId: "alpha-draft" },
+    });
+    assert.equal(missingConfirmation.structuredContent.error.code, "confirmation_required");
+    assert.equal(calls.includes("alpha:drafts.send"), false);
+
+    const confirmation = await client.callTool({
+      name: "gmail_send_message",
+      arguments: { account: "alpha", draftId: "alpha-draft", confirm: false },
+    });
+    assert.equal(confirmation.structuredContent.error.code, "confirmation_required");
+    assert.equal(calls.includes("alpha:drafts.send"), false);
+
+    const wrongAlias = await client.callTool({
+      name: "gmail_send_message",
+      arguments: { account: "beta", draftId: "alpha-draft", confirm: true },
+    });
+    assert.equal(wrongAlias.isError, true);
+    assert.equal(calls.includes("beta:drafts.send"), false);
+
+    const sent = await client.callTool({
+      name: "gmail_send_message",
+      arguments: { account: "alpha", draftId: "alpha-draft", confirm: true },
+    });
+    assert.deepEqual(sent.structuredContent, { account: "alpha", messageId: "alpha-sent", threadId: "alpha-thread" });
+
 
     const unknown = await client.callTool({ name: "gmail_get_message", arguments: { account: "missing", messageId: "beta-message" } });
     assert.deepEqual(unknown.structuredContent, {

@@ -36,6 +36,37 @@ function providerWithCalls(calls: string[]): AccountProvider {
             },
           };
         },
+        async send(params: { requestBody?: { raw?: string } }) {
+          calls.push(`send:${params.requestBody?.raw === undefined ? "draft" : "raw"}`);
+          return { data: { id: "sent-message", threadId: "sent-thread" } };
+        },
+      },
+      drafts: {
+        async create() {
+          calls.push("draft:create");
+          return { data: { id: "draft-1", message: { threadId: "thread-1" } } };
+        },
+        async send(params: { requestBody?: { id?: string } }) {
+          calls.push(`draft:send:${params.requestBody?.id ?? ""}`);
+          return { data: { id: "sent-message", threadId: "sent-thread" } };
+        },
+      },
+      threads: {
+        async get() {
+          calls.push("thread:get");
+          return {
+            data: {
+              messages: [{
+                payload: {
+                  headers: [
+                    { name: "Message-ID", value: "<parent@example.test>" },
+                    { name: "References", value: "<root@example.test>" },
+                  ],
+                },
+              }],
+            },
+          };
+        },
       },
     },
   } as unknown as GmailApiClient;
@@ -52,7 +83,15 @@ function providerWithCalls(calls: string[]): AccountProvider {
       if (alias !== "alpha" && alias !== "zeta") {
         throw new AccountProviderError("unknown_account", "untrusted provider detail", alias);
       }
-      return { alias, gmailClient };
+      return {
+        alias,
+        scopes: [
+          "https://www.googleapis.com/auth/gmail.readonly",
+          "https://www.googleapis.com/auth/gmail.compose",
+          "https://www.googleapis.com/auth/gmail.send",
+        ],
+        gmailClient,
+      };
     },
   };
 }
@@ -71,7 +110,13 @@ test("initializes and exercises account, search, and get-message tools", async (
   const { client, server } = await connectedPair(providerWithCalls(calls));
   try {
     const tools = await client.listTools();
-    assert.deepEqual(tools.tools.map((tool) => tool.name), ["gmail_accounts", "gmail_search", "gmail_get_message"]);
+    assert.deepEqual(tools.tools.map((tool) => tool.name), [
+      "gmail_accounts",
+      "gmail_search",
+      "gmail_get_message",
+      "gmail_create_draft",
+      "gmail_send_message",
+    ]);
 
     const accounts = await client.callTool({ name: "gmail_accounts", arguments: {} });
     assert.deepEqual(accounts.structuredContent, {
@@ -100,6 +145,56 @@ test("initializes and exercises account, search, and get-message tools", async (
       labels: [],
       attachments: [],
     });
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("requires immediate confirmation and prevents cross-alias draft sends", async () => {
+  const calls: string[] = [];
+  const { client, server } = await connectedPair(providerWithCalls(calls));
+  try {
+    const draft = await client.callTool({
+      name: "gmail_create_draft",
+      arguments: { account: "alpha", to: ["recipient@example.test"], subject: "subject", body: "body" },
+    });
+    assert.deepEqual(draft.structuredContent, { account: "alpha", draftId: "draft-1", threadId: "thread-1" });
+
+    const missingConfirmation = await client.callTool({
+      name: "gmail_send_message",
+      arguments: { account: "alpha", draftId: "draft-1" },
+    });
+    assert.equal(missingConfirmation.structuredContent.error.code, "confirmation_required");
+    assert.equal(calls.includes("draft:send:draft-1"), false);
+
+    const confirmation = await client.callTool({
+      name: "gmail_send_message",
+      arguments: { account: "alpha", draftId: "draft-1", confirm: false },
+    });
+    assert.deepEqual(confirmation.structuredContent, {
+      account: "alpha",
+      error: {
+        code: "confirmation_required",
+        message: "Explicit confirmation is required immediately before sending.",
+        account: "alpha",
+        remediation: "Obtain explicit user confirmation immediately before sending and state which account will send.",
+      },
+    });
+    assert.equal(calls.includes("draft:send:draft-1"), false);
+
+    const wrongAlias = await client.callTool({
+      name: "gmail_send_message",
+      arguments: { account: "zeta", draftId: "draft-1", confirm: true },
+    });
+    assert.equal(wrongAlias.isError, true);
+    assert.equal(calls.includes("draft:send:draft-1"), false);
+
+    const sent = await client.callTool({
+      name: "gmail_send_message",
+      arguments: { account: "alpha", draftId: "draft-1", confirm: true },
+    });
+    assert.deepEqual(sent.structuredContent, { account: "alpha", messageId: "sent-message", threadId: "sent-thread" });
   } finally {
     await client.close();
     await server.close();

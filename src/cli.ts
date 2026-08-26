@@ -50,6 +50,7 @@ export function createAccountProvider(options: AccountManagerOptions = {}): Acco
       const auth = await manager.getAccountSession(alias);
       return {
         alias,
+        scopes: await manager.getAccountScopes(alias),
         gmailClient: google.gmail({ version: "v1", auth }),
       };
     },
