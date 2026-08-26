@@ -108,7 +108,8 @@ function utf8PrefixByteLength(bytes: Uint8Array, maxBytes: number): number {
 }
 
 function truncateUtf8Bytes(bytes: Uint8Array, maxBytes: number): string {
-  return Buffer.from(bytes.subarray(0, utf8PrefixByteLength(bytes, maxBytes))).toString("utf8");
+  const length = utf8PrefixByteLength(bytes, maxBytes);
+  return Buffer.from(bytes.buffer, bytes.byteOffset, length).toString("utf8");
 }
 
 function decodeBase64UrlPrefix(data: unknown, maxBytes: number): string | undefined {
