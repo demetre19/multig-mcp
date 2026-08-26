@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, open, readFile, readdir, rename, rmdir, stat, unlink } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, readdir, rename, rm, stat, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, basename } from "node:path";
@@ -128,32 +128,157 @@ function processIsAlive(pid: number): boolean {
 }
 
 const LOCK_OWNER = "owner";
+const LOCK_RECOVERY_CLAIM = "recovery-claim";
+
+type FileIdentity = {
+  dev: number;
+  ino: number;
+};
 
 type LockHandle = {
   close: () => Promise<void>;
 };
 
-async function breakStaleLock(lockPath: string): Promise<boolean> {
-  const ownerPath = join(lockPath, LOCK_OWNER);
-  let details;
+type StaleLockSnapshot = {
+  lockIdentity: FileIdentity;
+  owner?: {
+    identity: FileIdentity;
+    contents: string;
+  };
+};
+
+function identityOf(value: { dev: number; ino: number }): FileIdentity {
+  return { dev: value.dev, ino: value.ino };
+}
+
+function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function uniqueLockPath(lockPath: string, purpose: string): string {
+  return join(dirname(lockPath), `.${basename(lockPath)}.${purpose}-${randomUUID()}`);
+}
+
+async function releaseRecoveryClaim(
+  claimPath: string,
+  claimHandle: FileHandle,
+  claimIdentity: FileIdentity,
+): Promise<void> {
+  await claimHandle.close().catch(() => undefined);
+  let currentIdentity: FileIdentity;
   try {
-    details = await stat(ownerPath);
+    currentIdentity = identityOf(await stat(claimPath));
+  } catch {
+    return;
+  }
+  if (!sameIdentity(currentIdentity, claimIdentity)) return;
+  await unlink(claimPath).catch(() => undefined);
+}
+
+async function quarantineStaleLock(lockPath: string, snapshot: StaleLockSnapshot): Promise<boolean> {
+  const ownerPath = join(lockPath, LOCK_OWNER);
+  const claimPath = join(lockPath, LOCK_RECOVERY_CLAIM);
+  let claimHandle: FileHandle;
+  try {
+    claimHandle = await open(claimPath, "wx", 0o600);
   } catch (error) {
-    if (!isMissing(error)) return false;
-    try {
-      details = await stat(lockPath);
-    } catch (lockError) {
-      return isMissing(lockError);
-    }
-    if (Date.now() - details.mtimeMs < LOCK_STALE_MS) return false;
-    try {
-      await rmdir(lockPath);
-      return true;
-    } catch (removeError) {
-      return isMissing(removeError);
+    return isMissing(error);
+  }
+  let claimIdentity: FileIdentity;
+  try {
+    claimIdentity = identityOf(await claimHandle.stat());
+  } catch {
+    await claimHandle.close().catch(() => undefined);
+    return true;
+  }
+
+  const releaseClaim = async (): Promise<void> => {
+    await releaseRecoveryClaim(claimPath, claimHandle, claimIdentity);
+  };
+
+  let currentLockIdentity: FileIdentity;
+  try {
+    currentLockIdentity = identityOf(await stat(lockPath));
+  } catch (error) {
+    await releaseClaim();
+    return isMissing(error);
+  }
+  if (!sameIdentity(currentLockIdentity, snapshot.lockIdentity)) {
+    await releaseClaim();
+    return false;
+  }
+
+  let currentOwnerDetails;
+  try {
+    currentOwnerDetails = await stat(ownerPath);
+  } catch (error) {
+    if (!isMissing(error)) {
+      await releaseClaim();
+      return false;
     }
   }
-  if (Date.now() - details.mtimeMs < LOCK_STALE_MS) return false;
+
+  if (snapshot.owner !== undefined) {
+    if (currentOwnerDetails === undefined || !sameIdentity(identityOf(currentOwnerDetails), snapshot.owner.identity)) {
+      await releaseClaim();
+      return currentOwnerDetails === undefined;
+    }
+    let currentContents: string;
+    try {
+      currentContents = await readFile(ownerPath, "utf8");
+    } catch (error) {
+      await releaseClaim();
+      return isMissing(error);
+    }
+    if (currentContents !== snapshot.owner.contents) {
+      await releaseClaim();
+      return false;
+    }
+  } else if (currentOwnerDetails !== undefined) {
+    let currentContents: string;
+    try {
+      currentContents = await readFile(ownerPath, "utf8");
+    } catch (error) {
+      await releaseClaim();
+      return isMissing(error);
+    }
+    if (Date.now() - currentOwnerDetails.mtimeMs < LOCK_STALE_MS || processIsAlive(Number.parseInt(currentContents.split("\n", 1)[0] ?? "", 10))) {
+      await releaseClaim();
+      return false;
+    }
+  }
+
+  const quarantinePath = uniqueLockPath(lockPath, "recovery");
+  try {
+    await rename(lockPath, quarantinePath);
+  } catch (error) {
+    await releaseClaim();
+    return isMissing(error);
+  }
+  await claimHandle.close().catch(() => undefined);
+  await rm(quarantinePath, { recursive: true, force: true }).catch(() => undefined);
+  return true;
+}
+
+async function breakStaleLock(lockPath: string): Promise<boolean> {
+  const ownerPath = join(lockPath, LOCK_OWNER);
+  let lockDetails;
+  try {
+    lockDetails = await stat(lockPath);
+  } catch (error) {
+    return isMissing(error);
+  }
+
+  let ownerDetails;
+  try {
+    ownerDetails = await stat(ownerPath);
+  } catch (error) {
+    if (!isMissing(error)) return false;
+    if (Date.now() - lockDetails.mtimeMs < LOCK_STALE_MS) return false;
+    return quarantineStaleLock(lockPath, { lockIdentity: identityOf(lockDetails) });
+  }
+  if (Date.now() - ownerDetails.mtimeMs < LOCK_STALE_MS) return false;
+
   let contents: string;
   try {
     contents = await readFile(ownerPath, "utf8");
@@ -162,17 +287,28 @@ async function breakStaleLock(lockPath: string): Promise<boolean> {
   }
   const pid = Number.parseInt(contents.split("\n", 1)[0] ?? "", 10);
   if (processIsAlive(pid)) return false;
+  return quarantineStaleLock(lockPath, {
+    lockIdentity: identityOf(lockDetails),
+    owner: { identity: identityOf(ownerDetails), contents },
+  });
+}
+
+async function releaseOwnedLock(lockPath: string, ownerPath: string, ownerIdentity: FileIdentity): Promise<void> {
+  let currentIdentity: FileIdentity;
   try {
-    await unlink(ownerPath);
-  } catch (error) {
-    if (!isMissing(error)) return false;
+    currentIdentity = identityOf(await stat(ownerPath));
+  } catch {
+    return;
   }
+  if (!sameIdentity(currentIdentity, ownerIdentity)) return;
+
+  const quarantinePath = uniqueLockPath(lockPath, "release");
   try {
-    await rmdir(lockPath);
-    return true;
-  } catch (error) {
-    return isMissing(error);
+    await rename(lockPath, quarantinePath);
+  } catch {
+    return;
   }
+  await rm(quarantinePath, { recursive: true, force: true }).catch(() => undefined);
 }
 
 async function acquireLock(lockPath: string): Promise<LockHandle> {
@@ -193,33 +329,29 @@ async function acquireLock(lockPath: string): Promise<LockHandle> {
     const ownerPath = join(lockPath, LOCK_OWNER);
     let ownerHandle: FileHandle | undefined;
     let ownerCreated = false;
+    let ownerIdentity: FileIdentity | undefined;
     try {
       ownerHandle = await open(ownerPath, "wx", 0o600);
       ownerCreated = true;
+      ownerIdentity = identityOf(await ownerHandle.stat());
       await ownerHandle.writeFile(`${process.pid}\n${Date.now()}\n${randomUUID()}\n`, "utf8");
       await ownerHandle.sync();
-      const ownerIdentity = await ownerHandle.stat();
+      const ownedIdentity = ownerIdentity;
+      if (ownedIdentity === undefined) throw new MetadataWriteError();
       let released = false;
       return {
         close: async () => {
           if (released) return;
           released = true;
           await ownerHandle?.close().catch(() => undefined);
-          let currentIdentity;
-          try {
-            currentIdentity = await stat(ownerPath);
-          } catch {
-            return;
-          }
-          if (currentIdentity.dev !== ownerIdentity.dev || currentIdentity.ino !== ownerIdentity.ino) return;
-          await unlink(ownerPath).catch(() => undefined);
-          await rmdir(lockPath).catch(() => undefined);
+          await releaseOwnedLock(lockPath, ownerPath, ownedIdentity);
         },
       };
     } catch (error) {
       await ownerHandle?.close().catch(() => undefined);
-      if (ownerCreated) await unlink(ownerPath).catch(() => undefined);
-      await rmdir(lockPath).catch(() => undefined);
+      if (ownerCreated && ownerIdentity !== undefined) {
+        await releaseOwnedLock(lockPath, ownerPath, ownerIdentity);
+      }
       if (error instanceof MetadataWriteError) throw error;
       throw new MetadataWriteError();
     }
