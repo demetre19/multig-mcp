@@ -1,0 +1,37 @@
+# Dependencies and build output
+node_modules/
+dist/
+build/
+coverage/
+
+# PRD orchestration and local run state
+.prd-runs/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+SECRET/
+secret/
+credentials/
+credential/
+oauth/
+OAuth/
+downloads/
+Downloads/
+client_secret*.json
+token*.json
+credentials*.json
+*credentials*.json
+oauth*.json
+*oauth*.json
+*.log
+logs/
+tmp/
+temp/
+
+# macOS metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
