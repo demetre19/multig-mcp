@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="${0:A:h}"
-ARCHIVE="$ROOT/multig-mcp-0.1.0.tgz"
+ARCHIVE="$ROOT/multig-mcp-0.1.1.tgz"
 APP="$HOME/Library/Application Support/multig-mcp/app"
 BIN="$HOME/.local/bin/multig-mcp"
 SKILLS="$HOME/.omp/agent/custom-skills"

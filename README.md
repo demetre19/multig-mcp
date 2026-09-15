@@ -27,7 +27,7 @@ The project does not require GitHub to run. This repository is private only beca
 
 Only the files required to install and understand the release:
 
-- `multig-mcp-0.1.0.tgz` — complete packaged app, native Keychain helper, and LLM skill
+- `multig-mcp-0.1.1.tgz` — complete packaged app, native Keychain helper, and LLM skill
 - `install.command` — installs the app and skill
 - `README.md` — these instructions
 - `multig-mcp-logo.jpg` — project image
